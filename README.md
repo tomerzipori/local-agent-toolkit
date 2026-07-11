@@ -16,26 +16,48 @@ local-agent --help
 
 The installer copies only `bin/local-agent` to `~/.local/bin`, safely upgrades
 that copy on repeat runs, adds `~/.local/bin` to `.zshrc`, and attempts
-interactive configuration when run from a terminal. Uninstall with:
+interactive configuration when run from a terminal. In a terminal, the
+installer prompts whether to install Codex instructions, Claude instructions,
+both, or neither. Choose explicitly for scripts and CI:
+
+```bash
+./install.sh --instructions codex
+./install.sh --instructions claude
+./install.sh --instructions both
+./install.sh --instructions none
+```
+
+Instructions are installed globally into `~/.codex/AGENTS.md` and/or
+`~/.claude/CLAUDE.md`. The toolkit-managed marker block is replaced safely on
+repeat installs while unrelated instructions are preserved. When the flag is
+omitted in a noninteractive environment, instruction installation is skipped.
+Restart existing Codex or Claude sessions after changing these files.
+
+Uninstall with:
 
 ```bash
 ./install.sh --uninstall
 ```
 
+Uninstall removes the binary and only the toolkit-managed instruction blocks.
 Configuration is saved at `~/.config/local-agent/config.json` with restrictive
-file permissions. The installer does not delete that configuration.
+file permissions, and the installer does not delete that configuration.
 
 ## Ollama models and settings
 
 ```bash
 local-agent models
+local-agent models --json
 local-agent configure
 local-agent files "Explain responsibilities and risks" src/client.py src/retry.py
 ```
 
-`models` uses Ollama's local `/api/tags` endpoint, the same model names shown by
-`ollama list`. Settings resolve in this order: command-line flag, environment,
-then saved configuration.
+Plain `models` prints the installed model names, one per line. `models --json`
+combines Ollama's `/api/tags` and `/api/show` endpoints and reports the host,
+configured default model, model sizes, family metadata, parameter sizes,
+quantization, capabilities, and context lengths. Missing optional metadata is
+reported as `null` or an empty list. Settings resolve in this order:
+command-line flag, environment, then saved configuration.
 
 ```bash
 export LOCAL_AGENT_MODEL='llama3.2:latest'

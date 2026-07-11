@@ -157,6 +157,80 @@ class LocalAgentTests(unittest.TestCase):
             self.assertEqual(payload["options"]["num_ctx"], 123)
             self.assertFalse(payload["stream"])
 
+    def test_enriched_model_inventory_uses_tags_and_show_and_fills_optional_metadata(self):
+        with mock.patch.object(local_agent, "request_json", side_effect=[
+            {
+                "models": [
+                    {"name": "coder:latest", "size": 123, "details": {"family": "tags-family"}},
+                    {"name": "small:latest"},
+                ]
+            },
+            {
+                "details": {
+                    "family": "llama",
+                    "families": ["llama"],
+                    "parameter_size": "7B",
+                    "quantization_level": "Q4_K_M",
+                },
+                "capabilities": ["completion"],
+                "model_info": {"llama.context_length": 8192},
+            },
+            {"details": {}, "model_info": {}},
+        ]) as request:
+            inventory = local_agent.model_inventory("http://host")
+
+        self.assertEqual(inventory, [
+            {
+                "name": "coder:latest",
+                "size_bytes": 123,
+                "family": "llama",
+                "families": ["llama"],
+                "parameter_size": "7B",
+                "quantization": "Q4_K_M",
+                "capabilities": ["completion"],
+                "context_length": 8192,
+            },
+            {
+                "name": "small:latest",
+                "size_bytes": None,
+                "family": None,
+                "families": [],
+                "parameter_size": None,
+                "quantization": None,
+                "capabilities": [],
+                "context_length": None,
+            },
+        ])
+        self.assertEqual(request.call_args_list[1].args[1:], ("/api/show", {"model": "coder:latest"}))
+        self.assertEqual(request.call_args_list[2].args[1:], ("/api/show", {"model": "small:latest"}))
+
+    def test_model_inventory_propagates_show_api_failures(self):
+        with mock.patch.object(local_agent, "request_json", side_effect=[
+            {"models": [{"name": "model:latest"}]},
+            RuntimeError("Ollama returned HTTP 404 at http://host/api/show: missing"),
+        ]):
+            message = self._error(local_agent.model_inventory, "http://host")
+        self.assertIn("HTTP 404", message)
+
+    def test_models_json_reports_default_and_plain_output_is_unchanged(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            with mock.patch.object(local_agent, "request_json", side_effect=[
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["host"], "http://host")
+            self.assertEqual(payload["default_model"], "coder:latest")
+            self.assertEqual(payload["models"][0]["name"], "coder:latest")
+
+            with mock.patch.object(local_agent, "request_json", return_value={"models": [{"name": "coder:latest"}]}), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = local_agent.main(["models", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            self.assertEqual(stdout.getvalue(), "coder:latest\n")
+
     def test_empty_models_missing_ollama_and_api_error(self):
         with OllamaServer({"models": []}) as server:
             message = self._error(local_agent.discover_models, server.host)
@@ -174,6 +248,14 @@ class LocalAgentTests(unittest.TestCase):
         with mock.patch.object(local_agent, "discover_models", return_value=["new"]):
             message = self._error(local_agent.call_ollama, "prompt", local_agent.Settings("old", "host", 1, 1))
         self.assertIn("is not installed", message)
+
+    def test_every_delegation_mode_accepts_explicit_model_precedence(self):
+        with temporary_home():
+            local_agent.save_config({"model": "saved"})
+            with mock.patch.dict(os.environ, {"LOCAL_AGENT_MODEL": "environment"}, clear=False):
+                for mode in local_agent.COMMANDS:
+                    args = local_agent.build_parser().parse_args([mode, "task", "--model", "cli"])
+                    self.assertEqual(local_agent.resolve_settings(args).model, "cli", mode)
 
     def test_select_model_accepts_number(self):
         with mock.patch("builtins.input", side_effect=["2"]):
@@ -309,9 +391,42 @@ class LocalAgentTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0)
             zshrc = (Path(home) / ".zshrc").read_text()
             self.assertEqual(zshrc.count('export PATH="$HOME/.local/bin:$PATH"'), 1)
+            self.assertFalse((Path(home) / ".codex/AGENTS.md").exists())
+            self.assertFalse((Path(home) / ".claude/CLAUDE.md").exists())
             subprocess.run(["bash", str(install), "--uninstall"], env=env, check=True, capture_output=True)
             subprocess.run(["bash", str(install), "--uninstall"], env=env, check=True, capture_output=True)
             self.assertFalse(target.exists())
+
+    def test_installer_instruction_modes_repeat_and_uninstall(self):
+        install = ROOT / "install.sh"
+        for mode in ("codex", "claude", "both", "none"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as home:
+                home_path = Path(home)
+                env = {**os.environ, "HOME": home}
+                (home_path / ".codex").mkdir()
+                (home_path / ".claude").mkdir()
+                (home_path / ".codex/AGENTS.md").write_text("Keep this Codex instruction.\n")
+                (home_path / ".claude/CLAUDE.md").write_text("Keep this Claude instruction.\n")
+                config = home_path / ".config/local-agent/config.json"
+                config.parent.mkdir(parents=True)
+                config.write_text('{"model": "saved"}\n')
+
+                subprocess.run(["bash", str(install), "--instructions", mode], env=env, check=True, capture_output=True)
+                subprocess.run(["bash", str(install), "--instructions", mode], env=env, check=True, capture_output=True)
+
+                codex = (home_path / ".codex/AGENTS.md").read_text()
+                claude = (home_path / ".claude/CLAUDE.md").read_text()
+                self.assertEqual(codex.count("<!-- BEGIN LOCAL-AGENT TOOLKIT -->"), int(mode in {"codex", "both"}))
+                self.assertEqual(claude.count("<!-- BEGIN LOCAL-AGENT TOOLKIT -->"), int(mode in {"claude", "both"}))
+                self.assertIn("Keep this Codex instruction.", codex)
+                self.assertIn("Keep this Claude instruction.", claude)
+
+                subprocess.run(["bash", str(install), "--uninstall"], env=env, check=True, capture_output=True)
+                subprocess.run(["bash", str(install), "--uninstall"], env=env, check=True, capture_output=True)
+                self.assertFalse((home_path / ".local/bin/local-agent").exists())
+                self.assertNotIn("<!-- BEGIN LOCAL-AGENT TOOLKIT -->", (home_path / ".codex/AGENTS.md").read_text())
+                self.assertNotIn("<!-- BEGIN LOCAL-AGENT TOOLKIT -->", (home_path / ".claude/CLAUDE.md").read_text())
+                self.assertEqual(config.read_text(), '{"model": "saved"}\n')
 
     @staticmethod
     def _error(function, *args):

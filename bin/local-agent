@@ -316,6 +316,58 @@ def discover_models(host: str) -> list[str]:
     return [str(name) for name in names]
 
 
+def _model_details(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _context_length(model_info: object) -> int | None:
+    if not isinstance(model_info, dict):
+        return None
+    for key, value in model_info.items():
+        if str(key).endswith(".context_length") and isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def model_inventory(host: str) -> list[dict[str, object]]:
+    result = request_json(host, "/api/tags")
+    raw_models = result.get("models", [])
+    if not isinstance(raw_models, list):
+        raise RuntimeError("Ollama returned an invalid model list.")
+    tagged_models = [item for item in raw_models if isinstance(item, dict) and item.get("name")]
+    if not tagged_models:
+        raise RuntimeError(
+            f"No Ollama models are installed at {host}. Run `ollama pull <model>` and try again."
+        )
+
+    inventory: list[dict[str, object]] = []
+    for tagged in tagged_models:
+        name = str(tagged["name"])
+        tagged_details = _model_details(tagged.get("details"))
+        shown = request_json(host, "/api/show", {"model": name})
+        shown_details = _model_details(shown.get("details"))
+        details = {**tagged_details, **shown_details}
+        families = details.get("families")
+        capabilities = shown.get("capabilities")
+        inventory.append({
+            "name": name,
+            "size_bytes": tagged.get("size") if isinstance(tagged.get("size"), int) else None,
+            "family": details.get("family") if isinstance(details.get("family"), str) else None,
+            "families": families if isinstance(families, list) else [],
+            "parameter_size": (
+                details.get("parameter_size") if isinstance(details.get("parameter_size"), str) else None
+            ),
+            "quantization": (
+                details.get("quantization_level")
+                if isinstance(details.get("quantization_level"), str)
+                else None
+            ),
+            "capabilities": capabilities if isinstance(capabilities, list) else [],
+            "context_length": _context_length(shown.get("model_info")),
+        })
+    return inventory
+
+
 def select_model(models: list[str], saved: str | None = None) -> str:
     print("Installed Ollama models:")
     for index, name in enumerate(models, 1):
@@ -527,6 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--num-ctx", type=int)
     configure.add_argument("--max-chars", type=int)
     models = subparsers.add_parser("models", help="List models installed in Ollama.")
+    models.add_argument("--json", action="store_true", dest="as_json")
     models.add_argument("--host")
     models.add_argument("--model")
     models.add_argument("--num-ctx", type=int)
@@ -569,6 +622,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "models":
             settings = resolve_settings(args, require_model=False)
+            if args.as_json:
+                print(json.dumps({
+                    "host": settings.host,
+                    "default_model": settings.model or None,
+                    "models": model_inventory(settings.host),
+                }, indent=2, sort_keys=True))
+                return 0
             for model in discover_models(settings.host):
                 print(model)
             return 0
