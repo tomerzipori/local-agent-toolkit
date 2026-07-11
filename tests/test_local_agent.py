@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import socket
 import subprocess
 import sys
@@ -25,6 +26,16 @@ assert SPEC and SPEC.loader
 local_agent = importlib.util.module_from_spec(SPEC)
 sys.modules["local_agent"] = local_agent
 SPEC.loader.exec_module(local_agent)
+
+
+class FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class FakePipe(io.StringIO):
+    def isatty(self):
+        return False
 
 
 @contextlib.contextmanager
@@ -89,6 +100,9 @@ class OllamaServer:
 
 
 class LocalAgentTests(unittest.TestCase):
+    def _validated_config(self):
+        return local_agent.validate_config(local_agent.load_config())
+
     def test_parser_covers_every_mode_and_version(self):
         for mode in local_agent.COMMANDS:
             args = local_agent.build_parser().parse_args([mode, "task"])
@@ -125,18 +139,21 @@ class LocalAgentTests(unittest.TestCase):
                 "LOCAL_AGENT_NUM_CTX": "30",
                 "LOCAL_AGENT_MAX_CHARS": "40",
             }, clear=False):
-                settings = local_agent.resolve_settings(args)
+                settings = local_agent.resolve_settings(args, self._validated_config())
                 self.assertEqual(settings.model, "environment")
                 self.assertEqual(settings.host, "http://environment")
                 self.assertEqual(settings.num_ctx, 30)
                 self.assertEqual(settings.max_chars, 40)
             args = SimpleNamespace(model="cli", host="http://cli", num_ctx=50, max_chars=60)
-            settings = local_agent.resolve_settings(args)
+            settings = local_agent.resolve_settings(args, self._validated_config())
             self.assertEqual(settings, local_agent.Settings("cli", "http://cli", 50, 60))
 
     def test_missing_and_malformed_configuration_are_actionable(self):
         with temporary_home() as home:
-            self.assertIn("No model is configured", self._error(local_agent.resolve_settings, SimpleNamespace(model=None, host=None, num_ctx=None, max_chars=None)))
+            self.assertIn(
+                "No model is configured",
+                self._error(local_agent.resolve_settings, SimpleNamespace(model=None, host=None, num_ctx=None, max_chars=None), {}),
+            )
             path = home / ".config/local-agent/config.json"
             path.parent.mkdir(parents=True)
             path.write_text("not json")
@@ -222,6 +239,7 @@ class LocalAgentTests(unittest.TestCase):
                 status = local_agent.main(["models", "--json", "--host", "http://host"])
             self.assertEqual(status, 0)
             payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["host"], "http://host")
             self.assertEqual(payload["default_model"], "coder:latest")
             self.assertEqual(payload["models"][0]["name"], "coder:latest")
@@ -255,7 +273,208 @@ class LocalAgentTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"LOCAL_AGENT_MODEL": "environment"}, clear=False):
                 for mode in local_agent.COMMANDS:
                     args = local_agent.build_parser().parse_args([mode, "task", "--model", "cli"])
-                    self.assertEqual(local_agent.resolve_settings(args).model, "cli", mode)
+                    self.assertEqual(local_agent.resolve_settings(args, self._validated_config()).model, "cli", mode)
+
+    def test_configure_model_flag_is_noninteractive(self):
+        with temporary_home():
+            local_agent.save_config({
+                "model": "saved:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 4096,
+                "max_chars": 9000,
+            })
+            with mock.patch.object(local_agent, "discover_models", return_value=["saved:latest", "qwen-coder:latest"]), mock.patch(
+                "builtins.input", side_effect=AssertionError("configure prompted unexpectedly")
+            ):
+                status = local_agent.main(["configure", "--model", "qwen-coder:latest"])
+            self.assertEqual(status, 0)
+            self.assertEqual(local_agent.load_config(), {
+                "schema_version": 1,
+                "model": "qwen-coder:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 4096,
+                "max_chars": 9000,
+            })
+
+    def test_configure_saves_host_num_ctx_and_max_chars(self):
+        with temporary_home():
+            with mock.patch.object(local_agent, "discover_models", return_value=["qwen-coder:latest"]):
+                status = local_agent.main([
+                    "configure",
+                    "--host",
+                    "http://127.0.0.1:11434",
+                    "--model",
+                    "qwen-coder:latest",
+                    "--num-ctx",
+                    "32768",
+                    "--max-chars",
+                    "120000",
+                ])
+            self.assertEqual(status, 0)
+            self.assertEqual(local_agent.load_config(), {
+                "schema_version": 1,
+                "model": "qwen-coder:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 32768,
+                "max_chars": 120000,
+            })
+
+    def test_configure_preserves_unspecified_values(self):
+        with temporary_home():
+            local_agent.save_config({
+                "model": "saved:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 8192,
+                "max_chars": 110000,
+                "extra_field": "preserve-me",
+            })
+            with mock.patch.object(local_agent, "discover_models", return_value=["saved:latest", "qwen-coder:latest"]):
+                status = local_agent.main(["configure", "--model", "qwen-coder:latest"])
+            self.assertEqual(status, 0)
+            self.assertEqual(local_agent.load_config(), {
+                "schema_version": 1,
+                "model": "qwen-coder:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 8192,
+                "max_chars": 110000,
+                "extra_field": "preserve-me",
+            })
+
+    def test_configure_interactive_preserves_non_model_settings(self):
+        with temporary_home():
+            local_agent.save_config({
+                "model": "saved:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 2048,
+                "max_chars": 7000,
+            })
+            stdin = FakeTTY()
+            stdout = FakeTTY()
+            with mock.patch.object(local_agent, "discover_models", return_value=["saved:latest", "qwen-coder:latest"]), mock.patch.object(
+                local_agent, "select_model", return_value="qwen-coder:latest"
+            ), mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", stdout):
+                status = local_agent.main(["configure"])
+            self.assertEqual(status, 0)
+            self.assertEqual(local_agent.load_config(), {
+                "schema_version": 1,
+                "model": "qwen-coder:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 2048,
+                "max_chars": 7000,
+            })
+
+    def test_configure_rejects_missing_model_at_effective_host(self):
+        with temporary_home(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            local_agent.save_config({
+                "model": "saved:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 4096,
+                "max_chars": 9000,
+            })
+            with mock.patch.object(local_agent, "discover_models", return_value=["different:latest"]):
+                status = local_agent.main(["configure", "--host", "http://127.0.0.1:11434", "--model", "missing:latest"])
+            self.assertEqual(status, 1)
+            self.assertIn("is not installed", stderr.getvalue())
+            self.assertEqual(local_agent.load_config()["model"], "saved:latest")
+
+    def test_configure_noninteractive_without_flags_fails(self):
+        stdin = FakePipe()
+        stdout = FakePipe()
+        with temporary_home(), mock.patch.object(sys, "stdin", stdin), mock.patch.object(
+            sys, "stdout", stdout
+        ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            status = local_agent.main(["configure"])
+        self.assertEqual(status, 2)
+        self.assertIn("configure requires explicit options in a noninteractive environment", stderr.getvalue())
+
+    def test_legacy_config_is_migrated(self):
+        with temporary_home() as home:
+            path = home / ".config/local-agent/config.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "model": "saved:latest",
+                "host": "http://127.0.0.1:11434",
+                "num_ctx": 4096,
+                "max_chars": 9000,
+            }) + "\n")
+            with mock.patch.object(local_agent, "discover_models", return_value=["saved:latest", "qwen-coder:latest"]):
+                status = local_agent.main(["configure", "--model", "qwen-coder:latest"])
+            self.assertEqual(status, 0)
+            self.assertEqual(local_agent.load_config()["schema_version"], 1)
+            self.assertEqual(local_agent.load_config()["host"], "http://127.0.0.1:11434")
+            self.assertEqual(local_agent.load_config()["num_ctx"], 4096)
+            self.assertEqual(local_agent.load_config()["max_chars"], 9000)
+
+    def test_future_config_schema_is_rejected(self):
+        with temporary_home() as home, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            path = home / ".config/local-agent/config.json"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"schema_version": 99, "model": "saved:latest"}\n')
+            status = local_agent.main(["configure", "--show"])
+        self.assertEqual(status, 1)
+        self.assertIn("supports up to 1", stderr.getvalue())
+
+    def test_config_save_is_atomic(self):
+        with temporary_home():
+            local_agent.save_config({"model": "saved:latest"})
+            path = local_agent.config_path()
+            with self.assertRaises(OSError):
+                with mock.patch.object(local_agent.os, "replace", side_effect=OSError("boom")):
+                    local_agent.save_config({"model": "next:latest"})
+            self.assertEqual(json.loads(path.read_text()), {"schema_version": 1, "model": "saved:latest"})
+            leftovers = [item.name for item in path.parent.iterdir() if item.name.startswith(f".{path.name}.")]
+            self.assertEqual(leftovers, [])
+
+    def test_config_permissions_are_0600(self):
+        with temporary_home():
+            local_agent.save_config({"model": "saved:latest"})
+            mode = stat.S_IMODE(local_agent.config_path().stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_configure_show_reports_setting_sources(self):
+        with temporary_home(), mock.patch.dict(os.environ, {"LOCAL_AGENT_HOST": "http://env-host:11434"}, clear=False):
+            local_agent.save_config({"model": "saved:latest", "num_ctx": 2048})
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = local_agent.main(["configure", "--show", "--model", "cli:latest"])
+            self.assertEqual(status, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("model: cli:latest [cli]", rendered)
+            self.assertIn("host: http://env-host:11434 [environment]", rendered)
+            self.assertIn("num_ctx: 2048 [saved config]", rendered)
+            self.assertIn("max_chars: 120000 [default]", rendered)
+
+    def test_models_json_contains_schema_version(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            with mock.patch.object(local_agent, "request_json", side_effect=[
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(stdout.getvalue())["schema_version"], 1)
+
+    def test_models_json_contract_remains_stable(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            with mock.patch.object(local_agent, "request_json", side_effect=[
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(set(payload), {"schema_version", "host", "default_model", "models"})
+            self.assertEqual(set(payload["models"][0]), {
+                "name",
+                "size_bytes",
+                "family",
+                "families",
+                "parameter_size",
+                "quantization",
+                "capabilities",
+                "context_length",
+            })
 
     def test_select_model_accepts_number(self):
         with mock.patch("builtins.input", side_effect=["2"]):
@@ -368,7 +587,11 @@ class LocalAgentTests(unittest.TestCase):
     def test_fix_test_executes_command_and_propagates_status(self):
         args = ["fix-test", "diagnose", "--command", "printf test-output; exit 3", "--model", "model"]
         captured = []
-        with mock.patch.object(local_agent, "call_ollama", side_effect=lambda prompt, _settings: captured.append(prompt) or "advice"), mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.object(
+            local_agent,
+            "call_ollama",
+            side_effect=lambda prompt, _settings, **_kwargs: captured.append(prompt) or "advice",
+        ), mock.patch.dict(os.environ, {}, clear=False):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):

@@ -54,11 +54,12 @@ local-agent files "Explain responsibilities and risks" src/client.py src/retry.p
 ```
 
 Plain `models` prints the installed model names, one per line. `models --json`
-combines Ollama's `/api/tags` and `/api/show` endpoints and reports the host,
-configured default model, model sizes, family metadata, parameter sizes,
-quantization, capabilities, and context lengths. Missing optional metadata is
-reported as `null` or an empty list. Settings resolve in this order:
-command-line flag, environment, then saved configuration.
+combines Ollama's `/api/tags` and `/api/show` endpoints and reports a
+versioned JSON document with `schema_version`, the host, the configured default
+model, model sizes, family metadata, parameter sizes, quantization,
+capabilities, and context lengths. Missing optional metadata is reported as
+`null` or an empty list. Settings resolve in this order: command-line flag,
+environment, then saved configuration.
 
 ```bash
 export LOCAL_AGENT_MODEL='llama3.2:latest'
@@ -68,7 +69,20 @@ export LOCAL_AGENT_MAX_CHARS='120000'
 ```
 
 If `LOCAL_AGENT_HOST` points to a non-local Ollama server, supplied source code
-is sent to that server. Keep the host local when source privacy matters.
+is sent to that server. Keep the host local when source privacy matters, or
+pass `--allow-remote-host` explicitly when remote use is intentional.
+
+`local-agent configure` is interactive only when stdin and stdout are terminals.
+Use `local-agent configure --show` to print the effective settings and their
+source, or update settings noninteractively:
+
+```bash
+local-agent configure --model qwen-coder:latest
+local-agent configure --host http://127.0.0.1:11434 --model qwen-coder:latest --num-ctx 32768 --max-chars 120000
+```
+
+Configuration is saved at `~/.config/local-agent/config.json` with schema
+version `1`, atomic writes, and mode `0600`.
 
 ## Commands
 
@@ -107,6 +121,13 @@ Append `instructions/AGENTS-snippet.md` to `AGENTS.md` and
 `instructions/CLAUDE-snippet.md` to `CLAUDE.md`. Restart existing sessions after
 changing instruction files. The snippets require independent review and testing
 of every model suggestion.
+
+For scripted installation without instruction snippets:
+
+```bash
+./install.sh --instructions none
+local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
+```
 
 ## Development
 
