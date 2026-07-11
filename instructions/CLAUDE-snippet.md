@@ -1,3 +1,5 @@
+Deprecated legacy snippet. The supported installation path is the personal Skill copied from `skills/local-agent-toolkit/`.
+
 ## Local agent worker
 
 A local Ollama coding worker is available through one command:
