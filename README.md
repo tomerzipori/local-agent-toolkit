@@ -28,11 +28,16 @@ local-agent --help
 
 The installer manages its own binary at
 `~/.local/share/local-agent-toolkit/bin/local-agent` and exposes
-`~/.local/bin/local-agent` as a symlink to that managed path. Repeat installs
-atomically replace only the managed binary when the public command is still
-owned by this toolkit. If `~/.local/bin/local-agent` is a regular file, a
-directory, or a symlink to something else, installation refuses to replace it
-and asks you to move or remove it manually first.
+`~/.local/bin/local-agent` as a symlink to that managed path.
+`~/.local/share/local-agent-toolkit` is the authoritative marker for a managed
+installation. If that directory already exists, rerunning `./install.sh` in an
+interactive terminal asks for exact lowercase `yes` or `no` confirmation before
+removing the managed install and reinstalling it. Scripted or CI reruns do not
+reinstall automatically; they exit successfully after explaining that
+reinstall confirmation requires an interactive terminal. If
+`~/.local/bin/local-agent` is a regular file, a directory, or a symlink to
+something else, installation refuses to replace it and asks you to move or
+remove it manually first.
 
 The installer adds a removable, toolkit-managed PATH block to `.zshrc` only
 when `~/.local/bin` is not already exported there elsewhere. In a terminal, the
@@ -49,9 +54,9 @@ both, or neither. Choose explicitly for scripts and CI:
 
 Instructions are installed globally into `~/.codex/AGENTS.md` and/or
 `~/.claude/CLAUDE.md`. The toolkit-managed marker block is replaced safely on
-repeat installs while unrelated instructions are preserved. When the flag is
-omitted in a noninteractive environment, instruction installation is skipped.
-Restart existing Codex or Claude sessions after changing these files.
+confirmed reinstalls while unrelated instructions are preserved. When the flag
+is omitted in a noninteractive environment, instruction installation is
+skipped. Restart existing Codex or Claude sessions after changing these files.
 
 Dry runs inspect the current public command, managed install paths, `.zshrc`,
 and instruction files, then print the changes that would be made without
@@ -68,7 +73,9 @@ Uninstall removes the public symlink only when it still resolves to the
 toolkit-managed binary, then removes the managed installation directory, the
 toolkit-managed PATH block, and the toolkit-managed instruction blocks. User
 configuration at `~/.config/local-agent/config.json` is preserved unless
-`--purge-config` is passed. Uninstall is still driven by the repository's
+`--purge-config` is passed. If no managed installation is present, uninstall
+prints `No prior installation found` and exits successfully without creating
+shell or instruction files. Uninstall is still driven by the repository's
 `install.sh`; a future `local-agent uninstall` command is not part of this
 branch.
 

@@ -46,6 +46,10 @@ path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
 }
 
+managed_install_exists() {
+    path_exists "$INSTALL_ROOT"
+}
+
 is_owned_public_link() {
     [ -L "$PUBLIC_BIN" ] || return 1
     [ "$(resolve_path "$PUBLIC_BIN")" = "$(resolve_path "$MANAGED_BIN")" ]
@@ -79,7 +83,6 @@ manage_block() {
         return 0
     fi
 
-    mkdir -p "$(dirname "$target")"
     python3 - "$target" "$operation" "$start_marker" "$end_marker" "$content_kind" "$content_value" <<'PY'
 from __future__ import annotations
 
@@ -131,7 +134,8 @@ else:
 if updated == existing:
     raise SystemExit(0)
 
-target.parent.mkdir(parents=True, exist_ok=True)
+if operation == "install":
+    target.parent.mkdir(parents=True, exist_ok=True)
 mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644
 fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
 try:
@@ -174,6 +178,12 @@ remove_managed_blocks() {
     manage_block "${HOME}/.codex/AGENTS.md" uninstall "$INSTRUCTION_START" "$INSTRUCTION_END" text ""
     manage_block "${HOME}/.claude/CLAUDE.md" uninstall "$INSTRUCTION_START" "$INSTRUCTION_END" text ""
     manage_block "$ZSHRC" uninstall "$PATH_BLOCK_START" "$PATH_BLOCK_END" text ""
+}
+
+cleanup_managed_install() {
+    remove_public_symlink_if_owned
+    remove_tree "$INSTALL_ROOT"
+    remove_managed_blocks
 }
 
 install_managed_binary() {
@@ -316,6 +326,26 @@ remove_public_symlink_if_owned() {
     note 'local-agent: public command is no longer owned by this installation; leaving it untouched'
 }
 
+confirm_reinstall() {
+    printf 'A managed local-agent installation already exists at %s.\n' "$INSTALL_ROOT"
+    printf 'Reinstalling will remove the managed installation and reinstall it.\n'
+    while :; do
+        read -r -p 'Type yes to reinstall or no to cancel: ' response
+        case "$response" in
+            yes)
+                return 0
+                ;;
+            no)
+                note 'Reinstall cancelled; existing installation was left unchanged.'
+                return 1
+                ;;
+            *)
+                printf 'Please enter exact lowercase yes or no.\n' >&2
+                ;;
+        esac
+    done
+}
+
 validate_instruction_sources() {
     case "$instructions" in
         codex|both)
@@ -379,9 +409,14 @@ fi
 require_python
 
 if [ "$uninstall" -eq 1 ]; then
-    remove_public_symlink_if_owned
-    remove_tree "$INSTALL_ROOT"
-    remove_managed_blocks
+    if ! managed_install_exists; then
+        if [ "$purge_config" -eq 1 ]; then
+            remove_tree "$CONFIG_DIR"
+        fi
+        note 'No prior installation found'
+        exit 0
+    fi
+    cleanup_managed_install
     if [ "$purge_config" -eq 1 ]; then
         remove_tree "$CONFIG_DIR"
     fi
@@ -415,6 +450,16 @@ elif [ -z "$instructions" ]; then
 fi
 
 validate_instruction_sources
+if managed_install_exists; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        note 'Managed installation already exists; reinstall confirmation requires an interactive terminal. Leaving the existing installation unchanged.'
+        exit 0
+    fi
+    if ! confirm_reinstall; then
+        exit 0
+    fi
+    cleanup_managed_install
+fi
 assert_install_target_available
 install_managed_binary
 ensure_public_symlink
