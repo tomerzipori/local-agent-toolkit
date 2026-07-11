@@ -151,7 +151,9 @@ class InstallerTests(LocalAgentTestCase):
             )
 
             self.assertIn("Please enter exact lowercase yes or no.", result.stdout)
-            self.assertIn("Reinstall cancelled; existing installation was left unchanged.", result.stdout)
+            self.assertIn(
+                "Reinstall cancelled; existing installation was left unchanged.", result.stdout
+            )
             self.assertEqual(managed.read_text(encoding="utf-8"), original)
 
     def test_repeat_install_noninteractive_leaves_install_unchanged(self):
