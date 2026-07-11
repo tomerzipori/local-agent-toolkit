@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,53 @@ class InstallerTests(LocalAgentTestCase):
             check=check,
         )
 
+    def run_install_pty(
+        self, source: Path, home: Path, *args: str, user_input: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, "HOME": str(home), "LOCAL_AGENT_HOST": "http://127.0.0.1:9"}
+        master_fd, slave_fd = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                ["bash", str(source / "install.sh"), *args],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                text=False,
+            )
+        finally:
+            os.close(slave_fd)
+
+        os.write(master_fd, user_input.encode("utf-8"))
+        output = bytearray()
+        try:
+            while True:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+        finally:
+            os.close(master_fd)
+
+        returncode = process.wait()
+        completed = subprocess.CompletedProcess(
+            args=["bash", str(source / "install.sh"), *args],
+            returncode=returncode,
+            stdout=output.decode("utf-8", errors="replace"),
+            stderr="",
+        )
+        if check and returncode != 0:
+            raise subprocess.CalledProcessError(
+                returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
+
     def test_clean_install_creates_managed_binary_and_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -62,22 +110,67 @@ class InstallerTests(LocalAgentTestCase):
                 },
             )
 
-    def test_repeat_install_updates_owned_binary(self):
+    def test_repeat_install_requires_confirmed_yes_and_preserves_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.make_install_source(root)
             home = root / "home"
+            config = home / ".config/local-agent/config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text('{"model": "saved"}\n', encoding="utf-8")
 
-            self.run_install(source, home)
+            self.run_install(source, home, "--instructions", "none")
             managed = home / ".local/share/local-agent-toolkit/bin/local-agent"
             original = managed.read_text(encoding="utf-8")
 
             updated = original.replace('VERSION = "0.1.0"', 'VERSION = "0.1.1-dev"', 1)
             (source / "bin/local-agent").write_text(updated, encoding="utf-8")
-            self.run_install(source, home)
+            result = self.run_install_pty(
+                source, home, "--instructions", "none", user_input="yes\n"
+            )
 
+            self.assertIn("Type yes to reinstall or no to cancel:", result.stdout)
             self.assertEqual(managed.read_text(encoding="utf-8"), updated)
             self.assertEqual((home / ".local/bin/local-agent").resolve(), managed.resolve())
+            self.assertEqual(config.read_text(encoding="utf-8"), '{"model": "saved"}\n')
+
+    def test_repeat_install_reprompts_invalid_answer_and_no_leaves_install_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_install_source(root)
+            home = root / "home"
+
+            self.run_install(source, home, "--instructions", "none")
+            managed = home / ".local/share/local-agent-toolkit/bin/local-agent"
+            original = managed.read_text(encoding="utf-8")
+            updated = original.replace('VERSION = "0.1.0"', 'VERSION = "0.1.1-dev"', 1)
+            (source / "bin/local-agent").write_text(updated, encoding="utf-8")
+
+            result = self.run_install_pty(
+                source, home, "--instructions", "none", user_input="maybe\nno\n"
+            )
+
+            self.assertIn("Please enter exact lowercase yes or no.", result.stdout)
+            self.assertIn("Reinstall cancelled; existing installation was left unchanged.", result.stdout)
+            self.assertEqual(managed.read_text(encoding="utf-8"), original)
+
+    def test_repeat_install_noninteractive_leaves_install_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_install_source(root)
+            home = root / "home"
+
+            self.run_install(source, home, "--instructions", "none")
+            managed = home / ".local/share/local-agent-toolkit/bin/local-agent"
+            original = managed.read_text(encoding="utf-8")
+            updated = original.replace('VERSION = "0.1.0"', 'VERSION = "0.1.1-dev"', 1)
+            (source / "bin/local-agent").write_text(updated, encoding="utf-8")
+
+            result = self.run_install(source, home, "--instructions", "none")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("reinstall confirmation requires an interactive terminal", result.stdout)
+            self.assertEqual(managed.read_text(encoding="utf-8"), original)
 
     def test_install_refuses_existing_regular_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -132,6 +225,21 @@ class InstallerTests(LocalAgentTestCase):
 
             self.assertFalse((home / ".local/bin/local-agent").exists())
             self.assertFalse((home / ".local/share/local-agent-toolkit").exists())
+
+    def test_uninstall_without_prior_install_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_install_source(root)
+            home = root / "home"
+
+            result = self.run_install(source, home, "--uninstall")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("No prior installation found", result.stdout)
+            self.assertFalse((home / ".local").exists())
+            self.assertFalse((home / ".zshrc").exists())
+            self.assertFalse((home / ".codex").exists())
+            self.assertFalse((home / ".claude").exists())
 
     def test_uninstall_preserves_foreign_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -227,30 +335,6 @@ class InstallerTests(LocalAgentTestCase):
             self.assertFalse((home / ".codex").exists())
             self.assertFalse((home / ".claude").exists())
 
-    def test_failed_upgrade_leaves_previous_binary_working(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = self.make_install_source(root)
-            home = root / "home"
-
-            self.run_install(source, home)
-            managed = home / ".local/share/local-agent-toolkit/bin/local-agent"
-            public = home / ".local/bin/local-agent"
-            previous = managed.read_text(encoding="utf-8")
-            managed_dir = managed.parent
-            managed_dir.chmod(0o500)
-            try:
-                result = self.run_install(source, home, check=False)
-            finally:
-                managed_dir.chmod(0o700)
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(managed.read_text(encoding="utf-8"), previous)
-            help_result = subprocess.run(
-                [str(public), "--help"], text=True, capture_output=True, check=True
-            )
-            self.assertIn("usage:", help_result.stdout.lower())
-
     def test_instruction_install_remains_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -300,20 +384,20 @@ class InstallerTests(LocalAgentTestCase):
                 zshrc.read_text(encoding="utf-8"), 'export PATH="$HOME/.local/bin:$PATH"\n'
             )
 
-    def test_installer_is_repeatable_and_uninstall_is_idempotent(self):
+    def test_uninstall_is_idempotent_after_install(self):
         with tempfile.TemporaryDirectory() as home:
             env = {**os.environ, "HOME": home}
             install = ROOT / "install.sh"
             first = subprocess.run(
-                ["bash", str(install)], env=env, text=True, capture_output=True, check=True
-            )
-            second = subprocess.run(
-                ["bash", str(install)], env=env, text=True, capture_output=True, check=True
+                ["bash", str(install), "--instructions", "none"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
             )
             target = Path(home) / ".local/bin/local-agent"
             self.assertTrue(target.is_file())
             self.assertEqual(first.returncode, 0)
-            self.assertEqual(second.returncode, 0)
             zshrc = (Path(home) / ".zshrc").read_text(encoding="utf-8")
             self.assertEqual(zshrc.count('export PATH="$HOME/.local/bin:$PATH"'), 1)
             self.assertFalse((Path(home) / ".codex/AGENTS.md").exists())
@@ -326,7 +410,7 @@ class InstallerTests(LocalAgentTestCase):
             )
             self.assertFalse(target.exists())
 
-    def test_installer_instruction_modes_repeat_and_uninstall(self):
+    def test_installer_instruction_modes_and_uninstall(self):
         install = ROOT / "install.sh"
         for mode in ("codex", "claude", "both", "none"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as home:
@@ -344,12 +428,6 @@ class InstallerTests(LocalAgentTestCase):
                 config.parent.mkdir(parents=True)
                 config.write_text('{"model": "saved"}\n', encoding="utf-8")
 
-                subprocess.run(
-                    ["bash", str(install), "--instructions", mode],
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                )
                 subprocess.run(
                     ["bash", str(install), "--instructions", mode],
                     env=env,

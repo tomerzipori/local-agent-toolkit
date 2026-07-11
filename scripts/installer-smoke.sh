@@ -22,7 +22,9 @@ test -x "$PUBLIC_BIN"
 command -v local-agent >/dev/null
 test "$(local-agent --version)" = "local-agent $EXPECTED_VERSION"
 
-bash "$INSTALLER" --instructions none
+REPEAT_OUTPUT="$(bash "$INSTALLER" --instructions none)"
+printf '%s' "$REPEAT_OUTPUT" | grep -F "reinstall confirmation requires an interactive terminal"
+test "$(local-agent --version)" = "local-agent $EXPECTED_VERSION"
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 printf '{"model":"saved"}\n' > "$CONFIG_PATH"
