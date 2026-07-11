@@ -1,3 +1,4 @@
+![Cover Image](assets/cover.png)
 # Local Agent toolkit
 
 `local-agent` is a macOS-focused, dependency-free Python 3 command for bounded
