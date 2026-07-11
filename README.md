@@ -1,7 +1,7 @@
 ![Cover Image](assets/cover.png)
 # Local Agent toolkit
 
-`local-agent` is a macOS-focused, dependency-free Python 3 command for bounded
+`local-agent` is a macOS-focused, dependency-free Python 3.10+ command for bounded
 coding assistance through a model installed in Ollama. Model output is
 untrusted advice: the parent agent must independently verify patches, commands,
 paths, and all test claims.
