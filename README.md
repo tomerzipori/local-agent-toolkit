@@ -11,79 +11,61 @@
 
 `local-agent` lets Codex, Claude Code, or a human developer delegate **small, bounded coding tasks** to an Ollama model running on local hardware.
 
-The goal is simple: use local compute for repeatable work such as repository exploration, file summaries, first-pass reviews, test ideas, diagnostics, and candidate patches—while reserving expensive cloud tokens and frontier-model attention for decisions that genuinely need them.
+Use local compute for repository exploration, first-pass reviews, test ideas, diagnostics, and candidate patches—while reserving expensive cloud tokens and frontier-model attention for harder decisions.
 
-The local model is a worker, not the authority. Its output is untrusted advice that the parent agent must verify before using.
+The local model is a worker, not the authority. Its output is untrusted advice that must be independently verified.
 
 > [!NOTE]
-> Token savings depend on the task, model, context size, and verification overhead. The toolkit makes delegation practical and controlled; it does not guarantee a fixed reduction in cloud usage.
+> Token savings depend on the task, model, context size, and verification overhead. The toolkit enables controlled delegation; it does not guarantee a fixed reduction in cloud usage.
 
 > [!TIP]
-> **Contributions are wanted.** New commands, safer workflows, model-selection improvements, agent integrations, platform support, examples, and documentation fixes are all welcome—including small first pull requests.
+> **Contributions are wanted.** New commands, model-selection improvements, integrations, platform support, tests, examples, and documentation fixes are all welcome.
 
-## The idea
-
-A frontier coding agent is excellent at orchestration and difficult reasoning, but it often spends context on work a smaller local model can handle:
-
-- finding likely files and symbols;
-- explaining a focused set of files;
-- drafting an implementation or test plan;
-- reviewing a diff before the parent agent reviews it again;
-- diagnosing supplied errors and test output;
-- proposing a small patch or a second opinion.
+## How it works
 
 ```mermaid
 flowchart LR
     A["Codex, Claude Code, or you<br/>Parent agent"]
     B["local-agent<br/>Bounded task + filtered context"]
     C["Ollama model<br/>Runs on local compute"]
-    D["Verified decision<br/>Tests, edits, or rejection"]
+    D["Verified result<br/>Accept, edit, or reject"]
 
-    A -->|Delegate a narrow task| B
-    B -->|Send selected context| C
-    C -->|Return untrusted advice| A
-    A -->|Verify independently| D
+    A -->|Delegate| B
+    B -->|Selected context| C
+    C -->|Untrusted advice| A
+    A -->|Verify| D
 ```
 
-With the default Ollama host, source context stays on your machine. The toolkit filters repository context, blocks sensitive paths by default, makes remote-host use explicit, and can recommend a safe installed model for the requested task and context size.
+With the default Ollama host, source context stays on your machine. The toolkit filters repository context, blocks sensitive paths by default, and can recommend a suitable installed model for the task and requested context size.
 
-## What it can do
+## Capabilities
 
-| Need | Commands | Result |
-| --- | --- | --- |
-| Choose a local model | `recommend-model`, `models` | An explainable recommendation based on task profile, context capacity, and estimated memory fit |
-| Explore a repository | `find`, `files` | Likely files, symbols, execution paths, and focused explanations |
-| Plan a change | `plan`, `impact` | Ordered implementation steps, affected areas, risks, and tests |
-| Review work | `review`, `review-staged`, `review-branch` | Actionable findings against current diffs |
-| Design or draft tests | `test-plan`, `write-tests` | Test cases or a candidate unified diff |
-| Diagnose failures | `diagnose`, `fix-test` | Root-cause hypotheses and a minimal correction proposal |
-| Challenge an approach | `second-opinion` | Hidden assumptions, counterexamples, and simpler alternatives |
-| Draft a small change | `patch` | A candidate unified diff for the parent agent to inspect |
+| Need | Commands |
+| --- | --- |
+| Choose a model | `recommend-model`, `models` |
+| Explore code | `find`, `files` |
+| Plan a change | `plan`, `impact` |
+| Review work | `review`, `review-staged`, `review-branch` |
+| Design or draft tests | `test-plan`, `write-tests` |
+| Diagnose failures | `diagnose`, `fix-test` |
+| Challenge an approach | `second-opinion` |
+| Draft a small patch | `patch` |
 
-Most commands are read-only. `patch` and `write-tests` print proposed diffs but do not apply them. `fix-test` is the exception: it executes the exact shell command supplied through `--command` before asking the model to analyze the result.
+Most commands are read-only. `patch` and `write-tests` print candidate diffs without applying them. `fix-test` executes the exact reviewed shell command supplied through `--command` before analyzing its output.
 
 ## Requirements
 
-- **macOS with zsh** is the primary supported environment.
-- **Python 3.10–3.13**. The CLI uses only the Python standard library.
-- **Ollama**, running locally or at an explicitly approved host.
-- At least one model already installed in Ollama.
-- **Git** for repository-aware commands such as reviews, impact analysis, and discovery.
-- Codex or Claude Code is optional; the CLI also works directly from a terminal.
+- macOS with zsh is the primary supported environment.
+- Python 3.10–3.13; the CLI uses only the standard library.
+- Ollama with at least one installed model.
+- Git for repository-aware commands.
+- Codex and Claude Code are optional; the CLI works directly from a terminal.
 
-Ubuntu is included in CI, but non-zsh installation behavior is not yet a fully supported public interface. The installer does not currently support Windows.
+Ubuntu is exercised in CI. Windows and non-zsh installation are not currently supported public interfaces.
 
 ## Quick start
 
-### 1. Install Ollama and a local model
-
-Confirm that Ollama is running and that at least one model is available:
-
-```bash
-ollama list
-```
-
-### 2. Install the toolkit
+### 1. Install the toolkit
 
 ```bash
 git clone https://github.com/tomerzipori/local-agent-toolkit.git
@@ -93,7 +75,7 @@ chmod +x install.sh
 source ~/.zshrc
 ```
 
-Choose the integration you actually use:
+Choose `codex`, `claude`, `both`, or `none`:
 
 ```bash
 ./install.sh --skills codex
@@ -102,15 +84,12 @@ Choose the integration you actually use:
 ./install.sh --skills none
 ```
 
-`--skills none` installs the CLI without adding a personal Codex or Claude Code skill.
-
-### 3. Inspect and configure models
+### 2. Inspect and configure models
 
 ```bash
+ollama list
 local-agent models
-local-agent models --verbose
 local-agent configure
-local-agent configure --show
 ```
 
 For noninteractive setup:
@@ -123,16 +102,24 @@ local-agent configure \
   --max-chars 120000
 ```
 
-### 4. Let the toolkit choose a model
-
-The recommender maps commands to fast, balanced, or strong quality profiles, filters models that do not fit the requested context or estimated memory budget, and returns a deterministic recommendation.
+### 3. Delegate a bounded task
 
 ```bash
-local-agent recommend-model files --num-ctx 8192
-local-agent recommend-model review --num-ctx 16384 --name-only
+local-agent files \
+  "Explain the responsibilities, assumptions, and risks" \
+  src/client.py src/retry.py
 ```
 
-Use the returned model explicitly with the same context size:
+Inspect the exact context before contacting Ollama:
+
+```bash
+local-agent files \
+  "Explain the retry flow" \
+  src/client.py src/retry.py \
+  --show-context-files
+```
+
+### 4. Let the toolkit choose a model
 
 ```bash
 MODEL="$(local-agent recommend-model review --num-ctx 16384 --name-only)"
@@ -143,123 +130,57 @@ local-agent review \
   --num-ctx 16384
 ```
 
-The recommender is read-only. It inspects installed and running model metadata, cached static metadata, and system memory; it does not load, unload, benchmark, or run inference with a model.
+The deterministic recommender filters models that lack the requested context or estimated memory capacity, then ranks the remaining candidates for the command. It reads metadata and system memory but never loads, unloads, benchmarks, or runs inference with a model.
 
-### 5. Try a bounded task
-
-```bash
-local-agent files \
-  "Explain the responsibilities, assumptions, and risks" \
-  src/client.py src/retry.py
-```
-
-Before sending anything to Ollama, inspect the exact context manifest:
-
-```bash
-local-agent files \
-  "Explain the retry flow" \
-  src/client.py src/retry.py \
-  --show-context-files
-```
-
-## Example workflows
-
-### Find where something is implemented
+## More examples
 
 ```bash
 local-agent find "Where is retry behavior implemented?"
-```
-
-### Review current changes
-
-```bash
-local-agent review "Look for correctness regressions and missing tests"
 local-agent review-staged "Pre-commit correctness review"
 local-agent review-branch "Review before opening a PR" --base origin/main
+local-agent plan "Add validation for empty package names" src/config.py tests/test_config.py
+git diff | local-agent second-opinion --stdin "Challenge the design choices"
+pytest tests/test_sampling.py -x 2>&1 | local-agent diagnose --stdin "Find the likely cause"
 ```
 
-### Plan a focused change
+`fix-test` deliberately executes its supplied command. Only pass commands you have personally reviewed and would run directly yourself.
 
-```bash
-local-agent plan \
-  "Add validation for empty package names" \
-  src/config.py tests/test_config.py
-```
+## Codex and Claude Code
 
-### Ask for a second opinion
-
-```bash
-git diff | local-agent second-opinion --stdin \
-  "Challenge the design choices in this diff"
-```
-
-### Diagnose failure output without executing it
-
-```bash
-pytest tests/test_sampling.py -x 2>&1 | \
-  local-agent diagnose --stdin \
-  "Explain the most likely root cause"
-```
-
-### Execute a reviewed test command and analyze the result
-
-```bash
-local-agent fix-test \
-  "Diagnose the failure and propose a minimal fix" \
-  --command 'pytest tests/test_sampling.py -x' \
-  src/sampling.py tests/test_sampling.py
-```
-
-Only pass commands to `fix-test` that you have personally reviewed and would run directly yourself.
-
-## Using it from Codex or Claude Code
-
-The installer can copy the toolkit's personal skill to:
+The installer can copy the personal skill to:
 
 - Codex: `~/.agents/skills/local-agent-toolkit`
 - Claude Code: `~/.claude/skills/local-agent-toolkit`
 
-Restart or refresh existing sessions after installation so the agent can rediscover the skill. Then use a prompt such as:
+Restart existing sessions after installation, then use a prompt such as:
 
 ```text
 Use local-agent to review the staged diff before you do your own review.
 ```
 
-The skill instructs the parent agent to recommend a model for the chosen command and planned context size, delegate one narrow task, and independently verify the result.
+The skill recommends a model, delegates one narrow task, and instructs the parent agent to verify the result. Installation does not guarantee that every session will invoke the skill automatically.
 
-Installing the skill enables the workflow, but it does not prove that every agent session will discover or invoke it automatically.
+## Safety boundaries
 
-## Context and safety boundaries
+By default, the toolkit:
 
-By default:
+- includes Git-tracked files only;
+- excludes ignored, untracked, sensitive, binary, symlinked, external, and oversized files;
+- limits file count, file size, and total context;
+- reports how much context is being sent.
 
-- explicit Git-tracked files are included;
-- directories expand to Git-tracked files only;
-- untracked and ignored files are excluded;
-- common secret and credential paths are blocked;
-- symlinks, binary files, oversized files, and files outside the repository are skipped;
-- context is bounded by file-count, file-size, and character limits;
-- the CLI reports how many files and characters are being sent.
+Opt-in flags include `--include-untracked`, `--include-ignored`, `--allow-sensitive-files`, `--allow-outside-repo`, `--allow-remote-host`, and `--allow-insecure-remote-host`.
 
-Relevant opt-in flags include:
-
-```text
---include-untracked
---include-ignored
---allow-sensitive-files
---allow-outside-repo
---allow-remote-host
---allow-insecure-remote-host
-```
-
-Use `--show-context-files` whenever the scope or sensitivity of a request is uncertain.
+Use `--show-context-files` whenever scope or sensitivity is uncertain.
 
 > [!IMPORTANT]
-> The default host is `http://127.0.0.1:11434`. If you configure a non-local Ollama host, supplied source code is sent to that server. Remote hosts require explicit approval flags, and remote plain-HTTP hosts require an additional insecure-host flag.
+> The default host is `http://127.0.0.1:11434`. A non-local host receives the supplied source context and requires explicit approval flags.
 
-## Model recommendation details
+Keep final decisions about credentials, permissions, destructive operations, deployments, migrations, security, broad data-integrity risks, and public APIs with the parent agent.
 
-Useful diagnostic commands:
+## Model recommendation
+
+Useful diagnostics:
 
 ```bash
 local-agent recommend-model review --num-ctx 16384 --json
@@ -267,84 +188,36 @@ local-agent models --verbose
 local-agent recommend-model review --refresh
 ```
 
-The recommender is conservative and explainable, not a universal quality leaderboard. It considers coding suitability, requested context, estimated memory fit, whether a model is already resident, parameter count, and quantization using command-specific ranking profiles.
-
-Important caveats:
-
-- installed artifact size is not exact runtime memory usage;
-- memory for unloaded models is estimated;
-- a model classified as safe may still run slowly;
-- parameter count does not fully determine quality;
-- mixture-of-experts total parameters can overstate active computation;
-- quantization is used conservatively rather than as a universal quality score;
-- preferences cannot bypass context or memory safety filters.
+The recommender is conservative, explainable, and deterministic—not a quality leaderboard. Memory use for unloaded models is estimated, a safe model may still run slowly, and parameter count or quantization alone does not determine quality. Preferences cannot bypass context or memory safety filters.
 
 ## Configuration
 
-Saved configuration lives at `~/.config/local-agent/config.json`.
-
-Settings resolve in this order:
-
-1. command-line option;
-2. environment variable;
-3. saved configuration;
-4. built-in default.
-
-```bash
-export LOCAL_AGENT_MODEL='your-installed-model-name'
-export LOCAL_AGENT_HOST='http://127.0.0.1:11434'
-export LOCAL_AGENT_NUM_CTX='32768'
-export LOCAL_AGENT_MAX_CHARS='120000'
-```
+Configuration is saved at `~/.config/local-agent/config.json`. Values resolve from command-line options, environment variables, saved configuration, then built-in defaults.
 
 | Setting | Default |
 | --- | ---: |
 | Ollama host | `http://127.0.0.1:11434` |
 | Model context window | `32768` tokens |
 | Supplied context budget | `120000` characters |
-| Maximum individual file size | `256000` bytes |
+| Maximum file size | `256000` bytes |
 | Maximum context files | `200` |
 
-See [the installer and configuration reference](docs/installer-reference.md) for managed paths, reinstall behavior, dry runs, skill ownership checks, model inventory details, remote-host rules, and uninstallation.
+See [the installer and configuration reference](docs/installer-reference.md) for managed paths, environment variables, reinstall behavior, model-cache details, remote hosts, and uninstallation.
 
-## What should stay with the parent agent
+## Contributing
 
-Do not use a local worker as the final decision-maker for credentials, permissions, destructive operations, deployments, migrations, security-sensitive changes, broad concurrency or data-integrity decisions, public API commitments, or any result that has not been independently inspected and tested.
+This project is intended to grow into a shared toolbox for practical local-model delegation. Small, focused pull requests are welcome.
 
-A local model can still gather evidence or challenge an approach, but the parent agent remains responsible for the final call.
+Useful contribution areas include:
 
-## Contributing is encouraged
-
-This project is intended to grow into a shared toolbox for practical local-model delegation. Contributions are not merely tolerated—they are part of the plan.
-
-Especially useful contributions include:
-
-- new commands for bounded, verifiable coding tasks;
-- model recommendation and memory-estimation improvements;
-- improved prompts and output contracts;
-- safer context collection and secret handling;
-- Codex, Claude Code, or other coding-agent integrations;
+- new bounded commands and integrations;
+- model recommendation and memory estimation;
+- prompts, output contracts, and safety controls;
 - Linux, Bash, Fish, or Windows support;
-- model compatibility notes and reproducible benchmarks;
+- reproducible model notes and benchmarks;
 - tests, documentation, and usability improvements.
 
-Small, focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), run the local checks, and explain the user-facing behavior your change adds or improves.
-
-Found a rough edge or have an idea that is not ready for code? [Open an issue](https://github.com/tomerzipori/local-agent-toolkit/issues).
-
-## Repository layout
-
-```text
-bin/local-agent                       # Dependency-free Python CLI
-install.sh                            # Managed installer and uninstaller
-skills/local-agent-toolkit/           # Codex and Claude Code personal skill
-skills/local-agent-toolkit/references/ # Delegation and verification policy
-scripts/                              # Development, benchmark, installer, and release checks
-tests/                                # Unit and installer behavior tests
-docs/                                 # Detailed user and contributor references
-```
-
-`bin/local-agent` is currently the executable's single source of truth.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), or [open an issue](https://github.com/tomerzipori/local-agent-toolkit/issues) for an idea or rough edge.
 
 ## Development
 
@@ -353,17 +226,15 @@ bash scripts/check.sh
 python3 -m unittest discover -s tests -v
 ```
 
-CI covers Python 3.10, 3.11, and 3.13 on Ubuntu, plus release-critical Python and installer checks on macOS. It also runs Ruff, ShellCheck, CodeQL, and secret scanning.
+CI tests Python 3.10, 3.11, and 3.13 and runs Ruff, ShellCheck, CodeQL, and secret scanning.
 
 ## Limitations
 
-- Local-model quality varies by model, quantization, context length, and task.
-- Context may be incomplete or truncated, especially for large repositories.
-- Local inference speed and capacity depend on your hardware.
+- Quality and speed depend on the model, quantization, context, task, and hardware.
+- Repository context may be incomplete or truncated.
 - The recommender estimates fit; it does not benchmark quality or performance.
-- macOS and zsh are the primary supported installation environment today.
-- Smaller models may produce invalid patches, miss cross-file behavior, or confidently state incorrect conclusions.
-- Saving cloud tokens still requires a parent workflow that delegates suitable work and verifies the result efficiently.
+- macOS and zsh are the primary supported installation environment.
+- Saving cloud tokens still requires careful task selection and efficient verification.
 
 ## Uninstall
 
@@ -372,7 +243,7 @@ CI covers Python 3.10, 3.11, and 3.13 on Ubuntu, plus release-critical Python an
 ./install.sh --uninstall --purge-config
 ```
 
-The uninstaller removes only toolkit-managed paths and marked integration blocks. See [the installer reference](docs/installer-reference.md) for the exact behavior.
+The uninstaller removes only toolkit-managed paths and marked integration blocks.
 
 ## License
 
