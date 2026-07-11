@@ -59,7 +59,6 @@ local-agent review-branch "Review before opening an MR" --base origin/main
 local-agent test-plan "Tests for deterministic package sampling" src/sampling.py
 local-agent write-tests "Add regression tests for duplicate IDs" src/sampling.py tests/test_sampling.py
 local-agent fix-test "Diagnose and propose a minimal fix" --command 'pytest tests/test_sampling.py -x' src/sampling.py
-local-agent sql-review "Check correctness and performance" src/queries.py
 git diff | local-agent second-opinion --stdin "Challenge the design choices in this diff"
 local-agent patch "Add validation for empty insight names" src/config.py tests/test_config.py
 ```

@@ -138,16 +138,6 @@ Return:
 TASK:
 {task}
 """,
-    "sql-review": """Review the supplied SQL or SQL-generating code.
-
-Focus on correctness, NULL semantics, duplicate handling, determinism,
-predicate placement, expensive operations, index opportunities, and
-transactional assumptions. Distinguish correctness findings from performance
-suggestions. For each finding give severity, evidence, and a concrete correction.
-
-TASK:
-{task}
-""",
     "second-opinion": """Challenge the supplied proposal or implementation.
 
 Do not merely restate it. Try to falsify it.

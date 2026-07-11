@@ -11,7 +11,6 @@ A local Ollama coding worker is available through one command:
 - `local-agent test-plan "<task>" <file...>`
 - `local-agent write-tests "<task>" <implementation-file> <test-file>`
 - `local-agent fix-test "<task>" --command '<test command>' <file...>`
-- `local-agent sql-review "<focus>" <file...>`
 - `local-agent second-opinion "<claim or proposal>" [file...]`
 - `local-agent patch "<task>" <file...>`
 
