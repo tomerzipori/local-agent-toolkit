@@ -41,26 +41,41 @@ remove it manually first.
 
 The installer adds a removable, toolkit-managed PATH block to `.zshrc` only
 when `~/.local/bin` is not already exported there elsewhere. In a terminal, the
-installer prompts whether to install Codex instructions, Claude instructions,
-both, or neither. Choose explicitly for scripts and CI:
+installer prompts whether to install the personal Codex skill, the personal
+Claude skill, both, or neither. Choose explicitly for scripts and CI:
+
+```bash
+./install.sh --skills codex
+./install.sh --skills claude
+./install.sh --skills both
+./install.sh --skills none
+./install.sh --dry-run --skills both
+```
+
+`--skills none` installs only the managed binary, PATH block, and state file.
+Existing personal skills and legacy instruction blocks are left unchanged.
+
+Codex is installed as a personal skill at `~/.agents/skills/local-agent-toolkit`
+and Claude Code is installed as a personal skill at
+`~/.claude/skills/local-agent-toolkit`. `./install.sh --skills both` processes
+Codex first and Claude second. A successful first target stays installed even
+if the second target fails, and the overall command exits nonzero for partial
+completion. Replacements are ownership-protected: unmanaged directories,
+symlinks, or malformed ownership markers fail safely instead of being replaced.
+
+The deprecated alias remains for one release:
 
 ```bash
 ./install.sh --instructions codex
-./install.sh --instructions claude
-./install.sh --instructions both
-./install.sh --instructions none
-./install.sh --dry-run --instructions both
 ```
 
-Instructions are installed globally into `~/.codex/AGENTS.md` and/or
-`~/.claude/CLAUDE.md`. The toolkit-managed marker block is replaced safely on
-confirmed reinstalls while unrelated instructions are preserved. When the flag
-is omitted in a noninteractive environment, instruction installation is
-skipped. Restart existing Codex or Claude sessions after changing these files.
+It selects the new skill-installation flow, prints a deprecation warning, and
+does not reinstall legacy global instruction blocks.
 
 Dry runs inspect the current public command, managed install paths, `.zshrc`,
-and instruction files, then print the changes that would be made without
-writing files or invoking `local-agent configure`.
+the canonical skill source, and the exact skill destination paths, then print
+the changes that would be made without writing files or invoking
+`local-agent configure`.
 
 Uninstall with:
 
@@ -71,11 +86,11 @@ Uninstall with:
 
 Uninstall removes the public symlink only when it still resolves to the
 toolkit-managed binary, then removes the managed installation directory, the
-toolkit-managed PATH block, and the toolkit-managed instruction blocks. User
-configuration at `~/.config/local-agent/config.json` is preserved unless
-`--purge-config` is passed. If no managed installation is present, uninstall
-prints `No prior installation found` and exits successfully without creating
-shell or instruction files. Uninstall is still driven by the repository's
+toolkit-managed PATH block, the matching legacy managed instruction blocks, and
+only the owned skill directories at the two known personal-skill destinations.
+User configuration at `~/.config/local-agent/config.json` is preserved unless
+`--purge-config` is passed. Uninstall never removes a parent skills directory
+or an unmarked destination. Uninstall is still driven by the repository's
 `install.sh`; a future `local-agent uninstall` command is not part of this
 branch.
 
@@ -173,15 +188,30 @@ map, targeted search results, and any staged or unstaged diff.
 
 ## Codex and Claude Code
 
-Append `instructions/AGENTS-snippet.md` to `AGENTS.md` and
-`instructions/CLAUDE-snippet.md` to `CLAUDE.md`. Restart existing sessions after
-changing instruction files. The snippets require independent review and testing
-of every model suggestion.
+The supported integration path is the copied personal Skill:
 
-For scripted installation without instruction snippets:
+- Codex: `~/.agents/skills/local-agent-toolkit`
+- Claude Code: `~/.claude/skills/local-agent-toolkit`
+
+After a successful skill installation, the installer removes only the matching
+toolkit-managed legacy block from `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`
+if it is present. Unrelated content, line endings, and final-newline behavior
+are preserved. The deprecated source snippets remain under `instructions/` only
+for migration compatibility and should not be appended manually.
+
+Restart or refresh existing sessions after installation so each product can
+rediscover the new personal Skill. Filesystem installation alone does not prove
+discovery or activation, so the recommended manual smoke check is:
+
+1. Start a fresh Codex or Claude Code session.
+2. Use a trigger prompt such as "Use local-agent to review this staged diff."
+3. Use a non-trigger prompt such as "Print the current time."
+4. Confirm the skill appears only for the relevant prompt.
+
+For scripted binary-only installation:
 
 ```bash
-./install.sh --instructions none
+./install.sh --skills none
 local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
 ```
 
@@ -203,7 +233,7 @@ Use `--show-context-files` to inspect exactly which files would be included or s
 
 ### macOS and zsh are the primary supported environment
 
-The installer and shell integration are currently designed primarily for macOS users running zsh. The installer manages `~/.zshrc`, installs the executable under `~/.local`, and can add global instructions for Codex and Claude Code.
+The installer and shell integration are currently designed primarily for macOS users running zsh. The installer manages `~/.zshrc`, installs the executable under `~/.local`, and can install personal skills for Codex and Claude Code in their supported user-level directories.
 
 Parts of the CLI may work on other Unix-like systems, and Ubuntu is used for automated testing, but installation behavior for other shells and operating systems is not yet a fully supported public interface. Windows is not currently supported by the installer.
 
