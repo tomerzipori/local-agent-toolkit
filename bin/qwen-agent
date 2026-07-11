@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Iterable
+
+DEFAULT_MODEL = "hf.co/unsloth/Qwen3-Coder-Next-GGUF:UD-IQ1_M"
+DEFAULT_HOST = "http://127.0.0.1:11434"
+DEFAULT_NUM_CTX = 32768
+DEFAULT_MAX_CHARS = 120_000
+
+SYSTEM_PROMPT = """You are a local coding worker subordinate to a stronger parent coding agent.
+
+Rules:
+- Work only on the assigned task.
+- Separate verified facts from hypotheses.
+- Cite exact file paths, symbols, and diff hunks whenever possible.
+- Never claim to have run a command or test unless its output is included.
+- Never invent files, APIs, symbols, dependencies, or test results.
+- State uncertainty explicitly.
+- Keep the scope narrow and avoid unrelated changes.
+- For proposed edits, prefer a minimal unified diff.
+- Do not recommend destructive Git operations.
+- Do not expose or reproduce secrets.
+- Your output will be independently reviewed by another coding agent.
+"""
+
+PROMPTS = {
+    "find": """Identify the most relevant files, symbols, and execution paths for the task.
+
+Return:
+1. Likely relevant files, ranked
+2. Key symbols
+3. Expected execution/data flow
+4. Suggested reading order
+5. Uncertainties and additional searches to run
+
+TASK:
+{task}
+""",
+    "files": """Analyze the supplied files.
+
+Return:
+1. Purpose of each file
+2. Important symbols and responsibilities
+3. How the files interact
+4. Important assumptions and invariants
+5. Risk areas and likely bugs
+6. Questions that remain unanswered
+
+USER FOCUS:
+{task}
+""",
+    "plan": """Produce an implementation plan only. Do not write the implementation.
+
+Return:
+1. Current behavior
+2. Relevant files and symbols
+3. Proposed changes in dependency order
+4. Tests to add or update
+5. Risks and compatibility concerns
+6. Open questions
+7. A concise recommended implementation sequence
+
+TASK:
+{task}
+""",
+    "review": """Review the supplied code or diff.
+
+Prioritize actionable findings. Do not summarize unchanged code.
+
+For every finding provide:
+- Severity: critical, high, medium, low
+- File and relevant symbol or hunk
+- Concrete problem
+- Why it matters
+- Minimal correction
+- Test that would detect it
+
+Also include:
+1. Missing tests
+2. Edge cases
+3. Explicitly state when no material issue is found
+
+REVIEW FOCUS:
+{task}
+""",
+    "test-plan": """Create a focused test plan for the supplied code or change.
+
+Return:
+1. Happy paths
+2. Boundary cases
+3. Invalid inputs and failure behavior
+4. Regression cases
+5. Important invariants
+6. Fixtures, mocks, and test data
+7. Suggested test names
+8. Highest-priority minimal test set
+
+TASK:
+{task}
+""",
+    "write-tests": """Propose tests for the supplied implementation.
+
+Requirements:
+- Match the existing test framework and style found in the context.
+- Reuse existing fixtures where possible.
+- Test externally observable behavior, not incidental implementation details.
+- Include regression tests for identified risks.
+- Return a minimal unified diff.
+- List assumptions after the diff.
+- Do not claim the tests pass.
+
+TASK:
+{task}
+""",
+    "fix-test": """Analyze the supplied failing test output and source context.
+
+Return:
+1. Immediate failure
+2. Most likely root cause
+3. Evidence versus speculation
+4. Minimal proposed correction
+5. A unified diff when enough context exists
+6. Commands/tests the parent agent should run
+7. Alternative hypotheses if confidence is limited
+
+TASK:
+{task}
+""",
+    "sql-review": """Review the supplied SQL or SQL-generating code.
+
+Focus on:
+- Join cardinality and accidental row multiplication
+- GROUP BY and aggregation correctness
+- NULL semantics
+- Duplicate handling
+- Determinism and ordering
+- Predicate placement
+- Expensive sorts, scans, and materialization
+- Index opportunities
+- Transactional or consistency assumptions
+
+For each finding give severity, evidence, and a concrete correction.
+Distinguish correctness findings from performance suggestions.
+
+TASK:
+{task}
+""",
+    "second-opinion": """Challenge the supplied proposal or implementation.
+
+Do not merely restate it. Try to falsify it.
+
+Return:
+1. Hidden assumptions
+2. Counterexamples and missing edge cases
+3. Simpler alternatives
+4. Risks the proposal understates
+5. Claims that are unsupported by the supplied evidence
+6. Final verdict: sound, sound with changes, or unsound
+
+TASK:
+{task}
+""",
+    "patch": """Propose a minimal implementation for the task using only the supplied context.
+
+Requirements:
+- Return a valid unified diff.
+- Avoid unrelated formatting or refactoring.
+- Preserve public interfaces unless explicitly requested.
+- Add or update tests when context permits.
+- Do not invent files or APIs.
+- After the diff, list assumptions and commands the parent agent should run.
+- Do not claim the patch applies or tests pass.
+
+TASK:
+{task}
+""",
+}
+
+
+def run_git(args: list[str]) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout
+
+
+def read_file(path: Path) -> str:
+    try:
+        if path.stat().st_size > 1_000_000:
+            return f"[Skipped {path}: file exceeds 1 MB]\n"
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"[Could not read {path}: {exc}]\n"
+
+
+def add_files(parts: list[str], paths: Iterable[str]) -> None:
+    for raw in paths:
+        path = Path(raw)
+        if not path.exists():
+            parts.append(f"\n===== MISSING FILE: {raw} =====\n")
+            continue
+        if path.is_dir():
+            parts.append(f"\n===== DIRECTORY TREE: {raw} =====\n")
+            entries = sorted(
+                str(p) for p in path.rglob("*")
+                if ".git" not in p.parts
+            )[:500]
+            parts.append("\n".join(entries))
+            continue
+        parts.append(f"\n===== FILE: {raw} =====\n")
+        parts.append(read_file(path))
+
+
+def truncate_context(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return (
+        text[:half]
+        + "\n\n[... CONTEXT TRUNCATED BY qwen-agent ...]\n\n"
+        + text[-half:]
+    )
+
+
+def call_ollama(prompt: str, model: str, host: str, num_ctx: int) -> str:
+    payload = {
+        "model": model,
+        "system": SYSTEM_PROMPT,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_ctx": num_ctx, "temperature": 0.1},
+    }
+    req = urllib.request.Request(
+        host.rstrip("/") + "/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Could not reach Ollama at {host}. Start Ollama and verify the model name.\n{exc}"
+        ) from exc
+
+    if "error" in data:
+        raise RuntimeError(str(data["error"]))
+    return data.get("response", "").strip()
+
+
+def ensure_repo() -> None:
+    if run_git(["rev-parse", "--is-inside-work-tree"]).strip() != "true":
+        raise RuntimeError("This command must be run inside a Git repository.")
+
+
+def collect_context(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+
+    if args.stdin:
+        piped = sys.stdin.read()
+        if piped:
+            parts.extend(["\n===== STDIN =====\n", piped])
+
+    add_files(parts, args.files or [])
+
+    if args.mode == "find":
+        ensure_repo()
+        parts.extend(["\n===== REPOSITORY FILE LIST =====\n", run_git(["ls-files"])[:80_000]])
+        terms = [t for t in args.task.replace("/", " ").split() if len(t) >= 4][:8]
+        for term in terms:
+            try:
+                result = subprocess.run(
+                    ["rg", "-n", "--hidden", "--glob", "!.git", term, "."],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.stdout:
+                    parts.extend([f"\n===== SEARCH: {term} =====\n", result.stdout[:20_000]])
+            except FileNotFoundError:
+                break
+
+    elif args.mode == "review-staged":
+        ensure_repo()
+        parts.extend([
+            "\n===== STAGED DIFF =====\n",
+            run_git(["diff", "--cached", "--no-ext-diff", "--unified=60"]),
+        ])
+
+    elif args.mode == "review-branch":
+        ensure_repo()
+        base = args.base or "main"
+        parts.extend([
+            f"\n===== DIFF AGAINST {base} =====\n",
+            run_git(["diff", f"{base}...HEAD", "--no-ext-diff", "--unified=60"]),
+        ])
+
+    elif args.mode == "review":
+        ensure_repo()
+        unstaged = run_git(["diff", "--no-ext-diff", "--unified=60"])
+        staged = run_git(["diff", "--cached", "--no-ext-diff", "--unified=60"])
+        if unstaged:
+            parts.extend(["\n===== UNSTAGED DIFF =====\n", unstaged])
+        if staged:
+            parts.extend(["\n===== STAGED DIFF =====\n", staged])
+
+    elif args.mode == "fix-test":
+        if not args.command:
+            raise RuntimeError("fix-test requires --command.")
+        completed = subprocess.run(
+            args.command,
+            shell=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        parts.extend([
+            f"\n===== TEST COMMAND =====\n{args.command}\n",
+            "\n===== TEST OUTPUT =====\n",
+            completed.stdout,
+            f"\n===== EXIT CODE: {completed.returncode} =====\n",
+        ])
+
+    return "".join(parts)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="qwen-agent",
+        description="Delegate bounded coding work to a local Qwen model via Ollama.",
+    )
+    parser.add_argument(
+        "mode",
+        choices=[
+            "find", "files", "plan", "review", "review-staged", "review-branch",
+            "test-plan", "write-tests", "fix-test", "sql-review",
+            "second-opinion", "patch",
+        ],
+    )
+    parser.add_argument("task", nargs="?", default="")
+    parser.add_argument("files", nargs="*")
+    parser.add_argument("--base", default=None)
+    parser.add_argument("--command", default=None)
+    parser.add_argument("--stdin", action="store_true")
+    parser.add_argument("--model", default=os.environ.get("LOCAL_QWEN_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--host", default=os.environ.get("OLLAMA_HOST_URL", DEFAULT_HOST))
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=int(os.environ.get("LOCAL_QWEN_NUM_CTX", DEFAULT_NUM_CTX)),
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=int(os.environ.get("LOCAL_QWEN_MAX_CHARS", DEFAULT_MAX_CHARS)),
+    )
+    parser.add_argument("--save", default=None)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    prompt_key = {"review-staged": "review", "review-branch": "review"}.get(args.mode, args.mode)
+
+    try:
+        context = collect_context(args)
+        if not context and not args.task:
+            raise RuntimeError("No task or context was supplied.")
+
+        prompt = PROMPTS[prompt_key].format(
+            task=args.task or "Analyze the supplied context."
+        )
+        prompt += "\n\nSUPPLIED CONTEXT:\n" + truncate_context(context, args.max_chars)
+        result = call_ollama(prompt, args.model, args.host, args.num_ctx)
+
+        if args.save:
+            Path(args.save).write_text(result + "\n", encoding="utf-8")
+        print(result)
+        return 0
+    except (RuntimeError, OSError) as exc:
+        print(f"qwen-agent: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
