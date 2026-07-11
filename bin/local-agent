@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""A dependency-free macOS CLI for bounded local-model coding assistance."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+VERSION = "1.0.0"
+DEFAULT_HOST = "http://127.0.0.1:11434"
+DEFAULT_NUM_CTX = 32768
+DEFAULT_MAX_CHARS = 120_000
+CONFIG_PATH = Path("~/.config/local-agent/config.json")
+
+SYSTEM_PROMPT = """You are a local coding worker subordinate to a stronger parent coding agent.
+
+Rules:
+- Work only on the assigned task.
+- Separate verified facts from hypotheses.
+- Cite exact file paths, symbols, and diff hunks whenever possible.
+- Never claim to have run a command or test unless its output is included.
+- Never invent files, APIs, symbols, dependencies, or test results.
+- State uncertainty explicitly.
+- Keep the scope narrow and avoid unrelated changes.
+- For proposed edits, prefer a minimal unified diff.
+- Do not recommend destructive Git operations.
+- Do not expose or reproduce secrets.
+- Your output is untrusted advice and will be independently reviewed.
+"""
+
+PROMPTS = {
+    "find": """Identify the most relevant files, symbols, and execution paths for the task.
+
+Return:
+1. Likely relevant files, ranked
+2. Key symbols
+3. Expected execution/data flow
+4. Suggested reading order
+5. Uncertainties and additional searches to run
+
+TASK:
+{task}
+""",
+    "files": """Analyze the supplied files.
+
+Return:
+1. Purpose of each file
+2. Important symbols and responsibilities
+3. How the files interact
+4. Important assumptions and invariants
+5. Risk areas and likely bugs
+6. Questions that remain unanswered
+
+USER FOCUS:
+{task}
+""",
+    "plan": """Produce an implementation plan only. Do not write the implementation.
+
+Return:
+1. Current behavior
+2. Relevant files and symbols
+3. Proposed changes in dependency order
+4. Tests to add or update
+5. Risks and compatibility concerns
+6. Open questions
+7. A concise recommended implementation sequence
+
+TASK:
+{task}
+""",
+    "review": """Review the supplied code or diff.
+
+Prioritize actionable findings. Do not summarize unchanged code.
+
+For every finding provide:
+- Severity: critical, high, medium, low
+- File and relevant symbol or hunk
+- Concrete problem
+- Why it matters
+- Minimal correction
+- Test that would detect it
+
+Also include:
+1. Missing tests
+2. Edge cases
+3. Explicitly state when no material issue is found
+
+REVIEW FOCUS:
+{task}
+""",
+    "test-plan": """Create a focused test plan for the supplied code or change.
+
+Return:
+1. Happy paths
+2. Boundary cases
+3. Invalid inputs and failure behavior
+4. Regression cases
+5. Important invariants
+6. Fixtures, mocks, and test data
+7. Suggested test names
+8. Highest-priority minimal test set
+
+TASK:
+{task}
+""",
+    "write-tests": """Propose tests for the supplied implementation.
+
+Requirements:
+- Match the existing test framework and style found in the context.
+- Reuse existing fixtures where possible.
+- Test externally observable behavior, not incidental implementation details.
+- Include regression tests for identified risks.
+- Return a minimal unified diff.
+- List assumptions after the diff.
+- Do not claim the tests pass.
+
+TASK:
+{task}
+""",
+    "fix-test": """Analyze the supplied failing test output and source context.
+
+Return:
+1. Immediate failure
+2. Most likely root cause
+3. Evidence versus speculation
+4. Minimal proposed correction
+5. A unified diff when enough context exists
+6. Commands/tests the parent agent should run
+7. Alternative hypotheses if confidence is limited
+
+TASK:
+{task}
+""",
+    "sql-review": """Review the supplied SQL or SQL-generating code.
+
+Focus on correctness, NULL semantics, duplicate handling, determinism,
+predicate placement, expensive operations, index opportunities, and
+transactional assumptions. Distinguish correctness findings from performance
+suggestions. For each finding give severity, evidence, and a concrete correction.
+
+TASK:
+{task}
+""",
+    "second-opinion": """Challenge the supplied proposal or implementation.
+
+Do not merely restate it. Try to falsify it.
+
+Return:
+1. Hidden assumptions
+2. Counterexamples and missing edge cases
+3. Simpler alternatives
+4. Risks the proposal understates
+5. Claims unsupported by the supplied evidence
+6. Final verdict: sound, sound with changes, or unsound
+
+TASK:
+{task}
+""",
+    "patch": """Propose a minimal implementation for the task using only the supplied context.
+
+Requirements:
+- Return a valid unified diff.
+- Avoid unrelated formatting or refactoring.
+- Preserve public interfaces unless explicitly requested.
+- Add or update tests when context permits.
+- Do not invent files or APIs.
+- After the diff, list assumptions and commands the parent agent should run.
+- Do not claim the patch applies or tests pass.
+
+TASK:
+{task}
+""",
+}
+
+MODES = tuple(PROMPTS)
+COMMANDS = MODES + ("review-staged", "review-branch")
+
+
+@dataclass(frozen=True)
+class Settings:
+    model: str
+    host: str
+    num_ctx: int
+    max_chars: int
+
+
+def config_path() -> Path:
+    return Path(os.path.expanduser(str(CONFIG_PATH)))
+
+
+def load_config() -> dict[str, object]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Configuration file {path} is malformed; remove it or run `local-agent configure`."
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Configuration file {path} must contain a JSON object; run `local-agent configure`."
+        )
+    return data
+
+
+def _setting(
+    args: argparse.Namespace, config: dict[str, object], name: str, env_name: str, default: object
+) -> object:
+    cli_value = getattr(args, name, None)
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value
+    return config.get(name, default)
+
+
+def resolve_settings(args: argparse.Namespace, require_model: bool = True) -> Settings:
+    config = load_config()
+    model = _setting(args, config, "model", "LOCAL_AGENT_MODEL", "")
+    host = _setting(args, config, "host", "LOCAL_AGENT_HOST", DEFAULT_HOST)
+    num_ctx = _setting(args, config, "num_ctx", "LOCAL_AGENT_NUM_CTX", DEFAULT_NUM_CTX)
+    max_chars = _setting(args, config, "max_chars", "LOCAL_AGENT_MAX_CHARS", DEFAULT_MAX_CHARS)
+    if require_model and (not isinstance(model, str) or not model):
+        raise RuntimeError(
+            "No model is configured. Run `local-agent configure`, set LOCAL_AGENT_MODEL, or pass --model."
+        )
+    try:
+        num_ctx = int(num_ctx)
+        max_chars = int(max_chars)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("num_ctx and max_chars must be positive integers.") from exc
+    if int(num_ctx) <= 0 or int(max_chars) <= 0:
+        raise RuntimeError("num_ctx and max_chars must be positive integers.")
+    if not isinstance(host, str) or not host:
+        raise RuntimeError("Ollama host must be a non-empty URL.")
+    if not isinstance(model, str):
+        raise RuntimeError("Configured model must be a string.")
+    return Settings(model, host.rstrip("/"), int(num_ctx), int(max_chars))
+
+
+def save_config(values: dict[str, object]) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def request_json(host: str, endpoint: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        host.rstrip("/") + endpoint,
+        data=data,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3600) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama returned HTTP {exc.code} at {host}{endpoint}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not reach Ollama at {host}. Start Ollama and verify the host is correct. ({exc})"
+        ) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Ollama returned invalid JSON at {host}{endpoint}.") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Ollama returned an unexpected response at {host}{endpoint}.")
+    if "error" in result:
+        raise RuntimeError(f"Ollama error at {host}{endpoint}: {result['error']}")
+    return result
+
+
+def discover_models(host: str) -> list[str]:
+    result = request_json(host, "/api/tags")
+    raw_models = result.get("models", [])
+    if not isinstance(raw_models, list):
+        raise RuntimeError("Ollama returned an invalid model list.")
+    names = [item.get("name") for item in raw_models if isinstance(item, dict) and item.get("name")]
+    if not names:
+        raise RuntimeError(
+            f"No Ollama models are installed at {host}. Run `ollama pull <model>` and try again."
+        )
+    return [str(name) for name in names]
+
+
+def select_model(models: list[str], saved: str | None = None) -> str:
+    print("Installed Ollama models:")
+    for index, name in enumerate(models, 1):
+        marker = " (current)" if name == saved else ""
+        print(f"  {index}. {name}{marker}")
+    while True:
+        choice = input("Select a default model by number or exact name: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
+        if choice in models:
+            return choice
+        print("Enter one of the listed numbers or exact model names.", file=sys.stderr)
+
+
+def repo_root() -> Path:
+    return Path(run_git(["rev-parse", "--show-toplevel"]).strip()).resolve()
+
+
+def run_git(args: list[str]) -> str:
+    result = subprocess.run(["git", *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout
+
+
+def ensure_repo() -> Path:
+    try:
+        return repo_root()
+    except RuntimeError as exc:
+        raise RuntimeError("This command must be run inside a Git repository.") from exc
+
+
+def checked_path(raw: str, root: Path, allow_outside: bool) -> Path:
+    path = Path(raw).expanduser()
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        if not allow_outside:
+            raise RuntimeError(
+                f"Refusing file outside the current repository: {raw}. "
+                "Use --allow-outside-repo only when this is intentional."
+            )
+    return resolved
+
+
+def is_binary(path: Path) -> bool:
+    try:
+        return b"\0" in path.read_bytes()[:8192]
+    except OSError:
+        return False
+
+
+def add_files(parts: list[str], paths: Iterable[str], args: argparse.Namespace, root: Path) -> None:
+    for raw in paths:
+        path = checked_path(raw, root, args.allow_outside_repo)
+        if not path.exists():
+            parts.append(f"\n===== MISSING FILE: {raw} =====\n")
+            continue
+        if path.is_symlink():
+            parts.append(f"\n===== SKIPPED SYMLINK: {raw} =====\n")
+            continue
+        candidates = [path]
+        if path.is_dir():
+            candidates = []
+            for candidate in sorted(path.rglob("*")):
+                if candidate.is_symlink() or ".git" in candidate.parts or not candidate.is_file():
+                    continue
+                candidates.append(candidate)
+        for candidate in candidates:
+            if is_binary(candidate):
+                parts.append(f"\n===== SKIPPED BINARY: {candidate} =====\n")
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                parts.append(f"\n===== SKIPPED UNREADABLE FILE: {candidate}: {exc} =====\n")
+                continue
+            parts.extend([f"\n===== FILE: {candidate} =====\n", content])
+
+
+def truncate_context(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    half = max(1, (limit - 80) // 2)
+    marker = f"\n\n[... CONTEXT TRUNCATED TO {limit} CHARACTERS ...]\n\n"
+    return text[:half] + marker + text[-half:], True
+
+
+def search_repository(root: Path, terms: Iterable[str]) -> list[str]:
+    matches: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or ".git" in path.parts or not path.is_file() or is_binary(path):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line_number, line in enumerate(lines, 1):
+            if any(term in line for term in terms):
+                matches.append(f"{path}:{line_number}:{line}")
+    return matches
+
+
+def default_base() -> str:
+    try:
+        remote_head = run_git(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]).strip()
+        if remote_head:
+            return remote_head
+    except RuntimeError:
+        pass
+    for candidate in ("main", "master"):
+        try:
+            run_git(["rev-parse", "--verify", candidate])
+            return candidate
+        except RuntimeError:
+            continue
+    raise RuntimeError("Could not determine a base branch; pass --base <branch> explicitly.")
+
+
+def collect_context(args: argparse.Namespace) -> tuple[str, int | None]:
+    parts: list[str] = []
+    command_status = None
+    root = ensure_repo() if args.mode in {"find", "review", "review-staged", "review-branch"} or args.files else None
+    if args.stdin:
+        piped = sys.stdin.read()
+        if piped:
+            parts.extend(["\n===== STDIN =====\n", piped])
+    if args.files:
+        assert root is not None
+        add_files(parts, args.files, args, root)
+    if args.mode == "find":
+        parts.extend(["\n===== REPOSITORY FILE LIST =====\n", run_git(["ls-files"])[:80_000]])
+        terms = [term for term in args.task.replace("/", " ").split() if len(term) >= 4][:8]
+        if root is not None:
+            matches = search_repository(root, terms)
+            if matches:
+                parts.extend(["\n===== REPOSITORY SEARCH =====\n", "\n".join(matches)[:20_000]])
+    elif args.mode == "review-staged":
+        parts.extend(["\n===== STAGED DIFF =====\n", run_git(["diff", "--cached", "--no-ext-diff", "--unified=60"])])
+    elif args.mode == "review-branch":
+        base = args.base or default_base()
+        parts.extend([f"\n===== DIFF AGAINST {base} =====\n", run_git(["diff", f"{base}...HEAD", "--no-ext-diff", "--unified=60"])])
+    elif args.mode == "review":
+        unstaged = run_git(["diff", "--no-ext-diff", "--unified=60"])
+        staged = run_git(["diff", "--cached", "--no-ext-diff", "--unified=60"])
+        if unstaged:
+            parts.extend(["\n===== UNSTAGED DIFF =====\n", unstaged])
+        if staged:
+            parts.extend(["\n===== STAGED DIFF =====\n", staged])
+    elif args.mode == "fix-test":
+        if not args.command:
+            raise RuntimeError("fix-test requires --command.")
+        print(f"Executing local shell command for fix-test: {args.command}", file=sys.stderr)
+        completed = subprocess.run(args.command, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        command_status = completed.returncode
+        parts.extend([
+            f"\n===== LOCAL TEST COMMAND (EXECUTED) =====\n{args.command}\n",
+            "\n===== TEST OUTPUT =====\n",
+            completed.stdout,
+            f"\n===== EXIT CODE: {completed.returncode} =====\n",
+        ])
+    return "".join(parts), command_status
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="local-agent", description="Delegate bounded coding work to an Ollama model.")
+    parser.add_argument("--version", action="version", version=f"local-agent {VERSION}")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    for mode in COMMANDS:
+        prompt_mode = "review" if mode in {"review-staged", "review-branch"} else mode
+        subparser = subparsers.add_parser(mode, help=PROMPTS[prompt_mode].splitlines()[0])
+        subparser.add_argument("task", nargs="?", default="")
+        subparser.add_argument("files", nargs="*")
+        subparser.add_argument("--model")
+        subparser.add_argument("--host")
+        subparser.add_argument("--num-ctx", type=int)
+        subparser.add_argument("--max-chars", type=int)
+        subparser.add_argument("--allow-outside-repo", action="store_true")
+        subparser.add_argument("--stdin", action="store_true")
+        subparser.add_argument("--save")
+        if mode == "review-branch":
+            subparser.add_argument("--base")
+        if mode == "fix-test":
+            subparser.add_argument("--command")
+    configure = subparsers.add_parser("configure", help="Select and save a default installed Ollama model.")
+    configure.add_argument("--host")
+    configure.add_argument("--model")
+    configure.add_argument("--num-ctx", type=int)
+    configure.add_argument("--max-chars", type=int)
+    models = subparsers.add_parser("models", help="List models installed in Ollama.")
+    models.add_argument("--host")
+    models.add_argument("--model")
+    models.add_argument("--num-ctx", type=int)
+    models.add_argument("--max-chars", type=int)
+    return parser
+
+
+def call_ollama(prompt: str, settings: Settings) -> str:
+    installed = discover_models(settings.host)
+    if settings.model not in installed:
+        raise RuntimeError(
+            f"Configured model `{settings.model}` is not installed at {settings.host}. "
+            "Run `local-agent models` or `local-agent configure`, or pass --model."
+        )
+    result = request_json(settings.host, "/api/generate", {
+        "model": settings.model,
+        "system": SYSTEM_PROMPT,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_ctx": settings.num_ctx, "temperature": 0.1},
+    })
+    response = result.get("response")
+    if not isinstance(response, str):
+        raise RuntimeError("Ollama returned no text response.")
+    return response.strip()
+
+
+def build_prompt(mode: str, task: str, context: str, max_chars: int) -> tuple[str, bool]:
+    prompt_key = "review" if mode in {"review-staged", "review-branch"} else mode
+    prompt = PROMPTS[prompt_key].format(task=task or "Analyze the supplied context.")
+    prompt += "\n\nSUPPLIED CONTEXT:\n"
+    context, truncated = truncate_context(context, max_chars)
+    if truncated:
+        prompt += f"[NOTICE: supplied context was truncated at {max_chars} characters.]\n"
+    return prompt + context, truncated
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.mode == "models":
+            settings = resolve_settings(args, require_model=False)
+            for model in discover_models(settings.host):
+                print(model)
+            return 0
+        if args.mode == "configure":
+            settings = resolve_settings(args, require_model=False)
+            models = discover_models(settings.host)
+            selected = select_model(models, load_config().get("model") if isinstance(load_config().get("model"), str) else None)
+            save_config({"model": selected})
+            print(f"Saved default model {selected} to {config_path()}")
+            return 0
+        settings = resolve_settings(args)
+        context, command_status = collect_context(args)
+        if not context and not args.task:
+            raise RuntimeError("No task or context was supplied.")
+        prompt, _ = build_prompt(args.mode, args.task, context, settings.max_chars)
+        result = call_ollama(prompt, settings)
+        if args.save:
+            Path(args.save).write_text(result + "\n", encoding="utf-8")
+        print(result)
+        if command_status:
+            print(f"local-agent: fix-test command exited with status {command_status}", file=sys.stderr)
+            return command_status
+        return 0
+    except (RuntimeError, OSError) as exc:
+        print(f"local-agent: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
