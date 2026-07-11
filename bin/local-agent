@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 VERSION = "1.0.0"
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_NUM_CTX = 32768
 DEFAULT_MAX_CHARS = 120_000
+CONFIG_SCHEMA_VERSION = 1
+MODELS_JSON_SCHEMA_VERSION = 1
 CONFIG_PATH = Path("~/.config/local-agent/config.json")
+CONFIG_FIELDS = ("model", "host", "num_ctx", "max_chars")
 
 SYSTEM_PROMPT = """You are a local coding worker subordinate to a stronger parent coding agent.
 
@@ -212,6 +218,10 @@ class Settings:
     max_chars: int
 
 
+class UsageError(RuntimeError):
+    """Raised for user-facing usage errors that should exit with status 2."""
+
+
 def config_path() -> Path:
     return Path(os.path.expanduser(str(CONFIG_PATH)))
 
@@ -233,50 +243,156 @@ def load_config() -> dict[str, object]:
     return data
 
 
+def _positive_int(value: object, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a positive integer.") from exc
+    if isinstance(value, bool) or parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive integer.")
+    return parsed
+
+
+def normalize_host(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("Ollama host must be a non-empty URL.")
+    host = value.strip()
+    parsed = urlparse(host)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("Ollama host must be an http:// or https:// URL.")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("Ollama host URLs must not include embedded credentials.")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise RuntimeError("Ollama host URLs must not include params, query strings, or fragments.")
+    if parsed.path not in {"", "/"}:
+        raise RuntimeError("Ollama host URLs must not include a path.")
+    return host.rstrip("/")
+
+
+def validate_config(data: dict[str, object]) -> dict[str, object]:
+    validated = dict(data)
+    raw_version = validated.get("schema_version", 0)
+    if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+        raise RuntimeError("Configuration schema_version must be an integer.")
+    if raw_version > CONFIG_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Configuration file {config_path()} uses schema_version {raw_version}, "
+            f"but this local-agent supports up to {CONFIG_SCHEMA_VERSION}. Upgrade local-agent first."
+        )
+    validated["schema_version"] = CONFIG_SCHEMA_VERSION
+    if "model" in validated:
+        model = validated["model"]
+        if not isinstance(model, str):
+            raise RuntimeError("Configured model must be a string.")
+        if not model:
+            raise RuntimeError("Configured model must not be empty.")
+    if "host" in validated:
+        validated["host"] = normalize_host(validated["host"])
+    if "num_ctx" in validated:
+        validated["num_ctx"] = _positive_int(validated["num_ctx"], "num_ctx")
+    if "max_chars" in validated:
+        validated["max_chars"] = _positive_int(validated["max_chars"], "max_chars")
+    return validated
+
+
 def _setting(
     args: argparse.Namespace, config: dict[str, object], name: str, env_name: str, default: object
-) -> object:
+) -> tuple[object, str]:
     cli_value = getattr(args, name, None)
     if cli_value is not None:
-        return cli_value
+        return cli_value, "cli"
     env_value = os.environ.get(env_name)
     if env_value is not None:
-        return env_value
-    return config.get(name, default)
+        return env_value, "environment"
+    if name in config:
+        return config[name], "saved config"
+    return default, "default"
 
 
-def resolve_settings(args: argparse.Namespace, require_model: bool = True) -> Settings:
-    config = load_config()
-    model = _setting(args, config, "model", "LOCAL_AGENT_MODEL", "")
-    host = _setting(args, config, "host", "LOCAL_AGENT_HOST", DEFAULT_HOST)
-    num_ctx = _setting(args, config, "num_ctx", "LOCAL_AGENT_NUM_CTX", DEFAULT_NUM_CTX)
-    max_chars = _setting(args, config, "max_chars", "LOCAL_AGENT_MAX_CHARS", DEFAULT_MAX_CHARS)
+def resolve_settings_with_sources(
+    args: argparse.Namespace, config: dict[str, object], require_model: bool = True
+) -> tuple[Settings, dict[str, str]]:
+    model, model_source = _setting(args, config, "model", "LOCAL_AGENT_MODEL", "")
+    host, host_source = _setting(args, config, "host", "LOCAL_AGENT_HOST", DEFAULT_HOST)
+    num_ctx, num_ctx_source = _setting(args, config, "num_ctx", "LOCAL_AGENT_NUM_CTX", DEFAULT_NUM_CTX)
+    max_chars, max_chars_source = _setting(args, config, "max_chars", "LOCAL_AGENT_MAX_CHARS", DEFAULT_MAX_CHARS)
     if require_model and (not isinstance(model, str) or not model):
         raise RuntimeError(
             "No model is configured. Run `local-agent configure`, set LOCAL_AGENT_MODEL, or pass --model."
         )
-    try:
-        num_ctx = int(num_ctx)
-        max_chars = int(max_chars)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("num_ctx and max_chars must be positive integers.") from exc
-    if int(num_ctx) <= 0 or int(max_chars) <= 0:
-        raise RuntimeError("num_ctx and max_chars must be positive integers.")
-    if not isinstance(host, str) or not host:
-        raise RuntimeError("Ollama host must be a non-empty URL.")
     if not isinstance(model, str):
         raise RuntimeError("Configured model must be a string.")
-    return Settings(model, host.rstrip("/"), int(num_ctx), int(max_chars))
+    settings = Settings(
+        model=model,
+        host=normalize_host(host),
+        num_ctx=_positive_int(num_ctx, "num_ctx"),
+        max_chars=_positive_int(max_chars, "max_chars"),
+    )
+    return settings, {
+        "model": model_source,
+        "host": host_source,
+        "num_ctx": num_ctx_source,
+        "max_chars": max_chars_source,
+    }
+
+
+def resolve_settings(args: argparse.Namespace, config: dict[str, object], require_model: bool = True) -> Settings:
+    settings, _ = resolve_settings_with_sources(args, config, require_model=require_model)
+    return settings
 
 
 def save_config(values: dict[str, object]) -> None:
     path = config_path()
+    payload = validate_config(values)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    path.chmod(0o600)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        os.replace(temp_path, path)
+        path.chmod(0o600)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-def request_json(host: str, endpoint: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+def update_config(changes: dict[str, object]) -> dict[str, object]:
+    config = validate_config(load_config())
+    merged = {**config, **changes, "schema_version": CONFIG_SCHEMA_VERSION}
+    validated = validate_config(merged)
+    save_config(validated)
+    return validated
+
+
+def is_local_host(host: str) -> bool:
+    parsed = urlparse(host)
+    hostname = parsed.hostname
+    if hostname is None:
+        return False
+    if hostname in {"localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def ensure_host_allowed(host: str, allow_remote_host: bool) -> None:
+    if not is_local_host(host) and not allow_remote_host:
+        raise RuntimeError(
+            f"Refusing to connect to non-local Ollama host {host}. "
+            "Pass --allow-remote-host only when sending repository content to that server is intentional."
+        )
+
+
+def request_json(
+    host: str, endpoint: str, payload: dict[str, object] | None = None, allow_remote_host: bool = False
+) -> dict[str, object]:
+    ensure_host_allowed(host, allow_remote_host)
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         host.rstrip("/") + endpoint,
@@ -303,8 +419,8 @@ def request_json(host: str, endpoint: str, payload: dict[str, object] | None = N
     return result
 
 
-def discover_models(host: str) -> list[str]:
-    result = request_json(host, "/api/tags")
+def discover_models(host: str, allow_remote_host: bool = False) -> list[str]:
+    result = request_json(host, "/api/tags", allow_remote_host=allow_remote_host)
     raw_models = result.get("models", [])
     if not isinstance(raw_models, list):
         raise RuntimeError("Ollama returned an invalid model list.")
@@ -329,8 +445,8 @@ def _context_length(model_info: object) -> int | None:
     return None
 
 
-def model_inventory(host: str) -> list[dict[str, object]]:
-    result = request_json(host, "/api/tags")
+def model_inventory(host: str, allow_remote_host: bool = False) -> list[dict[str, object]]:
+    result = request_json(host, "/api/tags", allow_remote_host=allow_remote_host)
     raw_models = result.get("models", [])
     if not isinstance(raw_models, list):
         raise RuntimeError("Ollama returned an invalid model list.")
@@ -344,7 +460,7 @@ def model_inventory(host: str) -> list[dict[str, object]]:
     for tagged in tagged_models:
         name = str(tagged["name"])
         tagged_details = _model_details(tagged.get("details"))
-        shown = request_json(host, "/api/show", {"model": name})
+        shown = request_json(host, "/api/show", {"model": name}, allow_remote_host=allow_remote_host)
         shown_details = _model_details(shown.get("details"))
         details = {**tagged_details, **shown_details}
         families = details.get("families")
@@ -380,6 +496,22 @@ def select_model(models: list[str], saved: str | None = None) -> str:
         if choice in models:
             return choice
         print("Enter one of the listed numbers or exact model names.", file=sys.stderr)
+
+
+def any_config_flags_supplied(args: argparse.Namespace) -> bool:
+    return any(getattr(args, name, None) is not None for name in CONFIG_FIELDS)
+
+
+def print_config(settings: Settings, sources: dict[str, str]) -> None:
+    values = {
+        "model": settings.model or "(unset)",
+        "host": settings.host,
+        "num_ctx": settings.num_ctx,
+        "max_chars": settings.max_chars,
+    }
+    print("Effective local-agent configuration:")
+    for name in CONFIG_FIELDS:
+        print(f"  {name}: {values[name]} [{sources[name]}]")
 
 
 def repo_root() -> Path:
@@ -566,6 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--host")
         subparser.add_argument("--num-ctx", type=int)
         subparser.add_argument("--max-chars", type=int)
+        subparser.add_argument("--allow-remote-host", action="store_true")
         subparser.add_argument("--allow-outside-repo", action="store_true")
         subparser.add_argument("--stdin", action="store_true")
         subparser.add_argument("--save")
@@ -578,29 +711,37 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--model")
     configure.add_argument("--num-ctx", type=int)
     configure.add_argument("--max-chars", type=int)
+    configure.add_argument("--allow-remote-host", action="store_true")
+    configure.add_argument("--show", action="store_true")
     models = subparsers.add_parser("models", help="List models installed in Ollama.")
     models.add_argument("--json", action="store_true", dest="as_json")
     models.add_argument("--host")
     models.add_argument("--model")
     models.add_argument("--num-ctx", type=int)
     models.add_argument("--max-chars", type=int)
+    models.add_argument("--allow-remote-host", action="store_true")
     return parser
 
 
-def call_ollama(prompt: str, settings: Settings) -> str:
-    installed = discover_models(settings.host)
+def call_ollama(prompt: str, settings: Settings, allow_remote_host: bool = False) -> str:
+    installed = discover_models(settings.host, allow_remote_host=allow_remote_host)
     if settings.model not in installed:
         raise RuntimeError(
             f"Configured model `{settings.model}` is not installed at {settings.host}. "
             "Run `local-agent models` or `local-agent configure`, or pass --model."
         )
-    result = request_json(settings.host, "/api/generate", {
-        "model": settings.model,
-        "system": SYSTEM_PROMPT,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_ctx": settings.num_ctx, "temperature": 0.1},
-    })
+    result = request_json(
+        settings.host,
+        "/api/generate",
+        {
+            "model": settings.model,
+            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_ctx": settings.num_ctx, "temperature": 0.1},
+        },
+        allow_remote_host=allow_remote_host,
+    )
     response = result.get("response")
     if not isinstance(response, str):
         raise RuntimeError("Ollama returned no text response.")
@@ -620,31 +761,59 @@ def build_prompt(mode: str, task: str, context: str, max_chars: int) -> tuple[st
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        config = validate_config(load_config())
         if args.mode == "models":
-            settings = resolve_settings(args, require_model=False)
+            settings = resolve_settings(args, config, require_model=False)
             if args.as_json:
                 print(json.dumps({
+                    "schema_version": MODELS_JSON_SCHEMA_VERSION,
                     "host": settings.host,
                     "default_model": settings.model or None,
-                    "models": model_inventory(settings.host),
+                    "models": model_inventory(settings.host, allow_remote_host=args.allow_remote_host),
                 }, indent=2, sort_keys=True))
                 return 0
-            for model in discover_models(settings.host):
+            for model in discover_models(settings.host, allow_remote_host=args.allow_remote_host):
                 print(model)
             return 0
         if args.mode == "configure":
-            settings = resolve_settings(args, require_model=False)
-            models = discover_models(settings.host)
-            selected = select_model(models, load_config().get("model") if isinstance(load_config().get("model"), str) else None)
-            save_config({"model": selected})
-            print(f"Saved default model {selected} to {config_path()}")
+            settings, sources = resolve_settings_with_sources(args, config, require_model=False)
+            if args.show:
+                print_config(settings, sources)
+                return 0
+            if any_config_flags_supplied(args):
+                models = discover_models(settings.host, allow_remote_host=args.allow_remote_host)
+                if settings.model:
+                    if settings.model not in models:
+                        raise RuntimeError(
+                            f"Configured model `{settings.model}` is not installed at {settings.host}. "
+                            "Run `local-agent models` or `ollama pull <model>`, or pick an installed model."
+                        )
+                updated = update_config({
+                    "model": settings.model,
+                    "host": settings.host,
+                    "num_ctx": settings.num_ctx,
+                    "max_chars": settings.max_chars,
+                })
+                print(f"Saved configuration to {config_path()} for model {updated.get('model', '(unset)')}")
+                return 0
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise UsageError("configure requires explicit options in a noninteractive environment")
+            models = discover_models(settings.host, allow_remote_host=args.allow_remote_host)
+            selected = select_model(models, settings.model or None)
+            update_config({
+                "model": selected,
+                "host": settings.host,
+                "num_ctx": settings.num_ctx,
+                "max_chars": settings.max_chars,
+            })
+            print(f"Saved configuration to {config_path()} for model {selected}")
             return 0
-        settings = resolve_settings(args)
+        settings = resolve_settings(args, config)
         context, command_status = collect_context(args)
         if not context and not args.task:
             raise RuntimeError("No task or context was supplied.")
         prompt, _ = build_prompt(args.mode, args.task, context, settings.max_chars)
-        result = call_ollama(prompt, settings)
+        result = call_ollama(prompt, settings, allow_remote_host=args.allow_remote_host)
         if args.save:
             Path(args.save).write_text(result + "\n", encoding="utf-8")
         print(result)
@@ -654,7 +823,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (RuntimeError, OSError) as exc:
         print(f"local-agent: {exc}", file=sys.stderr)
-        return 1
+        return 2 if isinstance(exc, UsageError) else 1
 
 
 if __name__ == "__main__":
