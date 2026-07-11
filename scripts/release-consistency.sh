@@ -10,7 +10,10 @@ if [ "$TAG" != "v$VERSION" ]; then
     exit 1
 fi
 
-grep -F "## $VERSION" "$ROOT/CHANGELOG.md" >/dev/null
+if ! grep -Eq "^## \\[$VERSION\\]( |$)" "$ROOT/CHANGELOG.md"; then
+    printf 'CHANGELOG.md is missing a release heading for version %s\n' "$VERSION" >&2
+    exit 1
+fi
 
 for required_file in \
     README.md \
@@ -21,5 +24,8 @@ for required_file in \
     SECURITY.md \
     SUPPORT.md
 do
-    test -f "$ROOT/$required_file"
+    if [ ! -f "$ROOT/$required_file" ]; then
+        printf 'Required release file is missing: %s\n' "$required_file" >&2
+        exit 1
+    fi
 done
