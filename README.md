@@ -1,320 +1,250 @@
-![Cover Image](assets/cover.png)
-# Local Agent toolkit
+![Local Agent Toolkit cover](assets/cover.png)
 
-`local-agent` is a macOS-focused, dependency-free Python command for bounded
-coding assistance through a model installed in Ollama. Model output is
-untrusted advice: the parent agent must independently verify patches, commands,
-paths, and all test claims.
+# Local Agent Toolkit
 
-## Supported Python
+**Keep frontier-model tokens for frontier-model work.**
 
-The supported runtime range is currently:
+[![CI](https://github.com/tomerzipori/local-agent-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tomerzipori/local-agent-toolkit/actions/workflows/ci.yml)
+![Python 3.10–3.13](https://img.shields.io/badge/Python-3.10%E2%80%933.13-blue)
+![Platform: macOS first](https://img.shields.io/badge/platform-macOS%20first-lightgrey)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- 3.10 minimum supported version
-- 3.11 actively tested midpoint
-- 3.13 newest supported version
+`local-agent` lets Codex, Claude Code, or a human developer delegate **small, bounded coding tasks** to an Ollama model running on local hardware.
 
-Ubuntu CI runs the full `3.10`, `3.11`, and `3.13` matrix. macOS CI runs the
-release-critical installer and unit-test coverage on `3.10` and `3.13`.
+Use local compute for repository exploration, first-pass reviews, test ideas, diagnostics, and candidate patches—while reserving expensive cloud tokens and frontier-model attention for harder decisions.
 
-## Install
+The local model is a worker, not the authority. Its output is untrusted advice that must be independently verified.
 
-```bash
-chmod +x install.sh
-./install.sh
-source ~/.zshrc
-local-agent --help
+> [!NOTE]
+> Token savings depend on the task, model, context size, and verification overhead. The toolkit enables controlled delegation; it does not guarantee a fixed reduction in cloud usage.
+
+> [!TIP]
+> **Contributions are wanted.** New commands, model-selection improvements, integrations, platform support, tests, examples, and documentation fixes are all welcome.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["Codex, Claude Code, or you<br/>Parent agent"]
+    B["local-agent<br/>Bounded task + filtered context"]
+    C["Ollama model<br/>Runs on local compute"]
+    D["Verified result<br/>Accept, edit, or reject"]
+
+    A -->|Delegate| B
+    B -->|Selected context| C
+    C -->|Untrusted advice| A
+    A -->|Verify| D
 ```
 
-The installer manages its own binary at
-`~/.local/share/local-agent-toolkit/bin/local-agent` and exposes
-`~/.local/bin/local-agent` as a symlink to that managed path.
-`~/.local/share/local-agent-toolkit` is the authoritative marker for a managed
-installation. If that directory already exists, rerunning `./install.sh` in an
-interactive terminal asks for exact lowercase `yes` or `no` confirmation before
-removing the managed install and reinstalling it. Scripted or CI reruns do not
-reinstall automatically; they exit successfully after explaining that
-reinstall confirmation requires an interactive terminal. If
-`~/.local/bin/local-agent` is a regular file, a directory, or a symlink to
-something else, installation refuses to replace it and asks you to move or
-remove it manually first.
+With the default Ollama host, source context stays on your machine. The toolkit filters repository context, blocks sensitive paths by default, and can recommend a suitable installed model for the task and requested context size.
 
-The installer adds a removable, toolkit-managed PATH block to `.zshrc` only
-when `~/.local/bin` is not already exported there elsewhere. In a terminal, the
-installer prompts whether to install the personal Codex skill, the personal
-Claude skill, both, or neither. Choose explicitly for scripts and CI:
+## Capabilities
+
+| Need | Commands |
+| --- | --- |
+| Choose a model | `recommend-model`, `models` |
+| Explore code | `find`, `files` |
+| Plan a change | `plan`, `impact` |
+| Review work | `review`, `review-staged`, `review-branch` |
+| Design or draft tests | `test-plan`, `write-tests` |
+| Diagnose failures | `diagnose`, `fix-test` |
+| Challenge an approach | `second-opinion` |
+| Draft a small patch | `patch` |
+
+Most commands are read-only. `patch` and `write-tests` print candidate diffs without applying them. `fix-test` executes the exact reviewed shell command supplied through `--command` before analyzing its output.
+
+## Requirements
+
+- macOS with zsh is the primary supported environment.
+- Python 3.10–3.13; the CLI uses only the standard library.
+- Ollama with at least one installed model.
+- Git for repository-aware commands.
+- Codex and Claude Code are optional; the CLI works directly from a terminal.
+
+Ubuntu is exercised in CI. Windows and non-zsh installation are not currently supported public interfaces.
+
+## Quick start
+
+### 1. Install the toolkit
+
+```bash
+git clone https://github.com/tomerzipori/local-agent-toolkit.git
+cd local-agent-toolkit
+chmod +x install.sh
+./install.sh --skills both
+source ~/.zshrc
+```
+
+Choose `codex`, `claude`, `both`, or `none`:
 
 ```bash
 ./install.sh --skills codex
 ./install.sh --skills claude
 ./install.sh --skills both
 ./install.sh --skills none
-./install.sh --dry-run --skills both
 ```
 
-`--skills none` installs only the managed binary, PATH block, and state file.
-Existing personal skills and legacy instruction blocks are left unchanged.
-
-Codex is installed as a personal skill at `~/.agents/skills/local-agent-toolkit`
-and Claude Code is installed as a personal skill at
-`~/.claude/skills/local-agent-toolkit`. `./install.sh --skills both` processes
-Codex first and Claude second. A successful first target stays installed even
-if the second target fails, and the overall command exits nonzero for partial
-completion. Replacements are ownership-protected: unmanaged directories,
-symlinks, or malformed ownership markers fail safely instead of being replaced.
-
-The deprecated alias remains for one release:
+### 2. Inspect and configure models
 
 ```bash
-./install.sh --instructions codex
+ollama list
+local-agent models
+local-agent configure
 ```
 
-It selects the new skill-installation flow, prints a deprecation warning, and
-does not reinstall legacy global instruction blocks.
+For noninteractive setup:
 
-Dry runs inspect the current public command, managed install paths, `.zshrc`,
-the canonical skill source, and the exact skill destination paths, then print
-the changes that would be made without writing files or invoking
-`local-agent configure`.
+```bash
+local-agent configure \
+  --model 'your-installed-model-name' \
+  --host http://127.0.0.1:11434 \
+  --num-ctx 32768 \
+  --max-chars 120000
+```
 
-Uninstall with:
+### 3. Delegate a bounded task
+
+```bash
+local-agent files \
+  "Explain the responsibilities, assumptions, and risks" \
+  src/client.py src/retry.py
+```
+
+Inspect the exact context before contacting Ollama:
+
+```bash
+local-agent files \
+  "Explain the retry flow" \
+  src/client.py src/retry.py \
+  --show-context-files
+```
+
+### 4. Let the toolkit choose a model
+
+```bash
+MODEL="$(local-agent recommend-model review --num-ctx 16384 --name-only)"
+
+local-agent review \
+  "Look for correctness regressions and missing tests" \
+  --model "$MODEL" \
+  --num-ctx 16384
+```
+
+The deterministic recommender filters models that lack the requested context or estimated memory capacity, then ranks the remaining candidates for the command. It reads metadata and system memory but never loads, unloads, benchmarks, or runs inference with a model.
+
+## More examples
+
+```bash
+local-agent find "Where is retry behavior implemented?"
+local-agent review-staged "Pre-commit correctness review"
+local-agent review-branch "Review before opening a PR" --base origin/main
+local-agent plan "Add validation for empty package names" src/config.py tests/test_config.py
+git diff | local-agent second-opinion --stdin "Challenge the design choices"
+pytest tests/test_sampling.py -x 2>&1 | local-agent diagnose --stdin "Find the likely cause"
+```
+
+`fix-test` deliberately executes its supplied command. Only pass commands you have personally reviewed and would run directly yourself.
+
+## Codex and Claude Code
+
+The installer can copy the personal skill to:
+
+- Codex: `~/.agents/skills/local-agent-toolkit`
+- Claude Code: `~/.claude/skills/local-agent-toolkit`
+
+Restart existing sessions after installation, then use a prompt such as:
+
+```text
+Use local-agent to review the staged diff before you do your own review.
+```
+
+The skill recommends a model, delegates one narrow task, and instructs the parent agent to verify the result. Installation does not guarantee that every session will invoke the skill automatically.
+
+## Safety boundaries
+
+By default, the toolkit:
+
+- includes Git-tracked files only;
+- excludes ignored, untracked, sensitive, binary, symlinked, external, and oversized files;
+- limits file count, file size, and total context;
+- reports how much context is being sent.
+
+Opt-in flags include `--include-untracked`, `--include-ignored`, `--allow-sensitive-files`, `--allow-outside-repo`, `--allow-remote-host`, and `--allow-insecure-remote-host`.
+
+Use `--show-context-files` whenever scope or sensitivity is uncertain.
+
+> [!IMPORTANT]
+> The default host is `http://127.0.0.1:11434`. A non-local host receives the supplied source context and requires explicit approval flags.
+
+Keep final decisions about credentials, permissions, destructive operations, deployments, migrations, security, broad data-integrity risks, and public APIs with the parent agent.
+
+## Model recommendation
+
+Useful diagnostics:
+
+```bash
+local-agent recommend-model review --num-ctx 16384 --json
+local-agent models --verbose
+local-agent recommend-model review --refresh
+```
+
+The recommender is conservative, explainable, and deterministic—not a quality leaderboard. Memory use for unloaded models is estimated, a safe model may still run slowly, and parameter count or quantization alone does not determine quality. Preferences cannot bypass context or memory safety filters.
+
+## Configuration
+
+Configuration is saved at `~/.config/local-agent/config.json`. Values resolve from command-line options, environment variables, saved configuration, then built-in defaults.
+
+| Setting | Default |
+| --- | ---: |
+| Ollama host | `http://127.0.0.1:11434` |
+| Model context window | `32768` tokens |
+| Supplied context budget | `120000` characters |
+| Maximum file size | `256000` bytes |
+| Maximum context files | `200` |
+
+See [the installer and configuration reference](docs/installer-reference.md) for managed paths, environment variables, reinstall behavior, model-cache details, remote hosts, and uninstallation.
+
+## Contributing
+
+This project is intended to grow into a shared toolbox for practical local-model delegation. Small, focused pull requests are welcome.
+
+Useful contribution areas include:
+
+- new bounded commands and integrations;
+- model recommendation and memory estimation;
+- prompts, output contracts, and safety controls;
+- Linux, Bash, Fish, or Windows support;
+- reproducible model notes and benchmarks;
+- tests, documentation, and usability improvements.
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), or [open an issue](https://github.com/tomerzipori/local-agent-toolkit/issues) for an idea or rough edge.
+
+## Development
+
+```bash
+bash scripts/check.sh
+python3 -m unittest discover -s tests -v
+```
+
+CI tests Python 3.10, 3.11, and 3.13 and runs Ruff, ShellCheck, CodeQL, and secret scanning.
+
+## Limitations
+
+- Quality and speed depend on the model, quantization, context, task, and hardware.
+- Repository context may be incomplete or truncated.
+- The recommender estimates fit; it does not benchmark quality or performance.
+- macOS and zsh are the primary supported installation environment.
+- Saving cloud tokens still requires careful task selection and efficient verification.
+
+## Uninstall
 
 ```bash
 ./install.sh --uninstall
 ./install.sh --uninstall --purge-config
 ```
 
-Uninstall removes the public symlink only when it still resolves to the
-toolkit-managed binary, then removes the managed installation directory, the
-toolkit-managed PATH block, the matching legacy managed instruction blocks, and
-only the owned skill directories at the two known personal-skill destinations.
-User configuration at `~/.config/local-agent/config.json` is preserved unless
-`--purge-config` is passed. Uninstall never removes a parent skills directory
-or an unmarked destination. Uninstall is still driven by the repository's
-`install.sh`; a future `local-agent uninstall` command is not part of this
-branch.
+The uninstaller removes only toolkit-managed paths and marked integration blocks.
 
-## Ollama models and settings
+## License
 
-```bash
-local-agent models
-local-agent models --json
-local-agent recommend-model review --num-ctx 16384 --name-only
-local-agent configure
-local-agent files "Explain responsibilities and risks" src/client.py src/retry.py
-```
-
-Plain `models` prints the installed model names, one per line. `models --json`
-reports a versioned JSON document with `schema_version`, the host, the
-configured default model, model sizes, family metadata, parameter sizes,
-quantization, capabilities, context lengths, running state, memory estimates,
-and cache status. Missing optional metadata is reported as `null` or an empty
-list. Settings resolve in this order: command-line flag, environment, then
-saved configuration.
-
-Normal agent use should ask the deterministic recommender for a model name and
-then pass that model explicitly:
-
-```bash
-MODEL="$(
-  local-agent recommend-model review \
-    --num-ctx 16384 \
-    --name-only
-)"
-
-local-agent review \
-  "Look for correctness regressions" \
-  src/client.py tests/test_client.py \
-  --model "$MODEL" \
-  --num-ctx 16384
-```
-
-For diagnostics:
-
-```bash
-local-agent recommend-model review \
-  --num-ctx 16384 \
-  --json
-local-agent models --verbose
-```
-
-To rebuild static model metadata:
-
-```bash
-local-agent recommend-model review --refresh
-```
-
-Warm recommendations read cached static metadata by model name and digest, then
-inspect `/api/tags`, `/api/ps`, and current system memory. They avoid
-`/api/show` when the cache is current, and they never load, unload, benchmark,
-or run inference with a model.
-
-```bash
-export LOCAL_AGENT_MODEL='llama3.2:latest'
-export LOCAL_AGENT_HOST='http://127.0.0.1:11434'
-export LOCAL_AGENT_NUM_CTX='32768'
-export LOCAL_AGENT_MAX_CHARS='120000'
-```
-
-If `LOCAL_AGENT_HOST` points to a non-local Ollama server, supplied source code
-is sent to that server. Keep the host local when source privacy matters, or
-pass `--allow-remote-host` explicitly when remote use is intentional. Remote
-HTTP hosts additionally require `--allow-insecure-remote-host`. Hosts with
-embedded credentials are rejected.
-
-`local-agent configure` is interactive only when stdin and stdout are terminals.
-Use `local-agent configure --show` to print the effective settings and their
-source, or update settings noninteractively:
-
-```bash
-local-agent configure --model qwen-coder:latest
-local-agent configure --host http://127.0.0.1:11434 --model qwen-coder:latest --num-ctx 32768 --max-chars 120000
-```
-
-Configuration is saved at `~/.config/local-agent/config.json` with schema
-version `1`, atomic writes, and mode `0600`.
-
-## Commands
-
-```bash
-local-agent find "Where is retry behavior implemented?"
-local-agent files "Explain responsibilities and risks" src/client.py src/retry.py
-local-agent plan "Add validation for empty package names" src/config.py tests/test_config.py
-local-agent review "Look for correctness regressions"
-local-agent review-staged "Pre-commit correctness review"
-local-agent review-branch "Review before opening an MR" --base origin/main
-local-agent test-plan "Tests for deterministic package sampling" src/sampling.py
-local-agent write-tests "Add regression tests for duplicate IDs" src/sampling.py tests/test_sampling.py
-local-agent diagnose "Explain this CI failure" --stdin tests/test_sampling.py
-local-agent fix-test "Diagnose and propose a minimal fix" --command 'pytest tests/test_sampling.py -x' src/sampling.py
-local-agent impact "Assess the blast radius of changing retry behavior" src/retry.py tests/test_retry.py
-git diff | local-agent second-opinion --stdin "Challenge the design choices in this diff"
-local-agent patch "Add validation for empty insight names" src/config.py tests/test_config.py
-```
-
-`review-branch` detects the repository's remote default branch, then falls back
-to `main` and `master`; `--base` is authoritative.
-
-Context collection is now policy-driven:
-
-- Explicit tracked files are included by default.
-- Directories expand to Git-tracked files only by default.
-- Explicit untracked files require `--include-untracked`.
-- Ignored files require `--include-ignored`.
-- Sensitive paths such as `.env`, private keys, `.ssh/*`, and
-  `credentials.json` require `--allow-sensitive-files`.
-- Files outside the current repository still require `--allow-outside-repo`.
-- Symlinks, binary files, and oversized files are skipped with explicit reasons.
-- `--max-file-bytes` defaults to `256000`.
-- `--max-context-files` defaults to `200`.
-
-Use `--show-context-files` to print the exact context-file manifest and exit
-without contacting Ollama. Normal runs print a concise stderr summary of how
-many files and characters are being sent, plus how many files were skipped.
-
-Ignored files are not included automatically, even when explicitly named,
-because `.gitignore` commonly covers build artifacts, local secrets, and other
-non-reviewable workspace data.
-
-`fix-test` deliberately executes the supplied local shell command. Its combined
-output and exit status are included in the model context, and a nonzero command
-status is returned after the model response.
-
-`diagnose` inspects supplied failure output and file or stdin context without
-executing a command. `impact` requires a Git repository and includes its file
-map, targeted search results, and any staged or unstaged diff.
-
-## Codex and Claude Code
-
-The supported integration path is the copied personal Skill:
-
-- Codex: `~/.agents/skills/local-agent-toolkit`
-- Claude Code: `~/.claude/skills/local-agent-toolkit`
-
-After a successful skill installation, the installer removes only the matching
-toolkit-managed legacy block from `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`
-if it is present. Unrelated content, line endings, and final-newline behavior
-are preserved. The deprecated source snippets remain under `instructions/` only
-for migration compatibility and should not be appended manually.
-
-Restart or refresh existing sessions after installation so each product can
-rediscover the new personal Skill. Filesystem installation alone does not prove
-discovery or activation, so the recommended manual smoke check is:
-
-1. Start a fresh Codex or Claude Code session.
-2. Use a trigger prompt such as "Use local-agent to review this staged diff."
-3. Use a non-trigger prompt such as "Print the current time."
-4. Confirm the skill appears only for the relevant prompt.
-
-For scripted binary-only installation:
-
-```bash
-./install.sh --skills none
-local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
-```
-
-## Limitations
-
-### Model quality is not guaranteed
-
-The quality of each result depends on the selected Ollama model, its coding ability, quantization, context length, and the context supplied to it. Smaller or heavily quantized models may misunderstand code, miss cross-file behavior, produce invalid patches, or make incorrect claims.
-
-`local-agent` does not treat model output as authoritative. Every referenced file, symbol, command, test claim, and proposed patch must be independently verified before use. Security-sensitive, destructive, deployment-related, or public-API decisions should not be delegated to a local model as the final decision-maker.
-
-The recommender is conservative and explainable, not a quality leaderboard.
-Installed size is not exact runtime memory usage, runtime memory for unloaded
-models is estimated, and a model classified as safe may still generate slowly.
-Parameter count does not fully determine model quality, mixture-of-experts total
-parameters can overstate active computation, and quantization comparisons are
-only used conservatively. Unsafe models are never selected, and preferences
-cannot bypass context or memory safety filters.
-
-### Context may be incomplete or truncated
-
-The toolkit applies limits to individual file size, total context size, and the number of files included in a request. Files may also be skipped because they are ignored, untracked, sensitive, binary, symlinked, unreadable, outside the repository, or larger than the configured limits.
-
-When the supplied repository context exceeds the configured character budget, it is truncated before being sent to the model. A model may therefore produce an incomplete or incorrect answer because it did not receive every relevant implementation detail.
-
-Use `--show-context-files` to inspect exactly which files would be included or skipped. For large tasks, prefer several focused requests over sending an entire repository at once.
-
-### macOS and zsh are the primary supported environment
-
-The installer and shell integration are currently designed primarily for macOS users running zsh. The installer manages `~/.zshrc`, installs the executable under `~/.local`, and can install personal skills for Codex and Claude Code in their supported user-level directories.
-
-Parts of the CLI may work on other Unix-like systems, and Ubuntu is used for automated testing, but installation behavior for other shells and operating systems is not yet a fully supported public interface. Windows is not currently supported by the installer.
-
-Users of Bash, Fish, Windows, or nonstandard shell configurations may need to install the executable and configure `PATH` manually.
-
-### `fix-test` executes a local shell command
-
-Unlike `diagnose`, the `fix-test` command executes the value supplied through `--command` using the local shell. The command's combined output and exit status are then included in the model context.
-
-For example:
-
-```bash
-local-agent fix-test \
-  "Diagnose and propose a minimal fix" \
-  --command 'pytest tests/test_sampling.py -x' \
-  src/sampling.py
-```
-
-Only use `fix-test` with commands you have personally reviewed and would be comfortable running directly in the current environment. Do not pass commands copied from untrusted model output, issue reports, repository files, logs, or external contributors without inspecting them first.
-
-For untrusted failure output, use `diagnose` instead. It analyzes supplied text and file context without executing a command.
-
-## Development
-
-Local checks:
-
-```bash
-bash scripts/check.sh
-```
-
-If you only want the unit suite:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-The current executable version is `0.1.0`, with `bin/local-agent` remaining the
-single source of truth until packaging becomes necessary.
+[MIT](LICENSE) © 2026 Tomer Zipori
