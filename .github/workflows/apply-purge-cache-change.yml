@@ -21,3 +21,223 @@ jobs:
       - name: Apply implementation
         shell: bash
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"Expected text not found in {path}: {old!r}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace(
+              "install.sh",
+              'CONFIG_DIR="${HOME}/.config/local-agent"\nZSHRC=',
+              'CONFIG_DIR="${HOME}/.config/local-agent"\nCACHE_DIR="${HOME}/.cache/local-agent"\nZSHRC=',
+          )
+          replace(
+              "install.sh",
+              '''    if [ "$purge_config" -eq 1 ]; then
+                  if path_exists "$CONFIG_DIR"; then
+                      remove_tree "$CONFIG_DIR"
+                      removed_any=1
+                  fi
+              fi
+          ''',
+              '''    if [ "$purge_config" -eq 1 ]; then
+                  if path_exists "$CONFIG_DIR"; then
+                      remove_tree "$CONFIG_DIR"
+                      removed_any=1
+                  fi
+                  if path_exists "$CACHE_DIR"; then
+                      remove_tree "$CACHE_DIR"
+                      removed_any=1
+                  fi
+              fi
+          ''',
+          )
+          replace(
+              "install.sh",
+              "note 'Removed toolkit-managed binary, owned skills, managed blocks, and local-agent configuration.'",
+              "note 'Removed toolkit-managed binary, owned skills, managed blocks, local-agent configuration, and cache.'",
+          )
+          replace(
+              "install.sh",
+              "note 'Removed toolkit-managed binary, owned skills, and managed blocks (configuration was kept).'",
+              "note 'Removed toolkit-managed binary, owned skills, and managed blocks (configuration and cache were kept).'",
+          )
+
+          replace(
+              "tests/test_installer.py",
+              "    def test_dry_run_install_and_uninstall_are_read_only(self):",
+              "    def test_dry_run_install_and_uninstall_are_read_only(self):",
+          )
+          replace(
+              "tests/test_installer.py",
+              '''            uninstall_result = self.run_install(source, home, "--dry-run", "--uninstall")
+              self.assertEqual(uninstall_result.returncode, 0)
+              self.assertFalse(self.managed_root(home).exists())
+          ''',
+              '''            config = home / ".config/local-agent/config.json"
+              cache = home / ".cache/local-agent/model-metadata-v1.json"
+              config.parent.mkdir(parents=True)
+              cache.parent.mkdir(parents=True)
+              config.write_text('{"model":"saved"}\n', encoding="utf-8")
+              cache.write_text('{"models":[]}\n', encoding="utf-8")
+
+              uninstall_result = self.run_install(
+                  source, home, "--dry-run", "--uninstall", "--purge-config"
+              )
+              self.assertEqual(uninstall_result.returncode, 0)
+              self.assertFalse(self.managed_root(home).exists())
+              self.assertEqual(config.read_text(encoding="utf-8"), '{"model":"saved"}\n')
+              self.assertEqual(cache.read_text(encoding="utf-8"), '{"models":[]}\n')
+              self.assertIn(str(config.parent), uninstall_result.stdout)
+              self.assertIn(str(cache.parent), uninstall_result.stdout)
+          ''',
+          )
+          replace(
+              "tests/test_installer.py",
+              "    def test_uninstall_removes_only_owned_skills_and_preserves_config_by_default(self):",
+              "    def test_uninstall_removes_only_owned_skills_and_preserves_config_and_cache_by_default(self):",
+          )
+          replace(
+              "tests/test_installer.py",
+              '''            config = home / ".config/local-agent/config.json"
+              config.parent.mkdir(parents=True)
+              config.write_text('{"model":"saved"}\n', encoding="utf-8")
+              foreign = self.claude_skill(home)
+          ''',
+              '''            config = home / ".config/local-agent/config.json"
+              cache = home / ".cache/local-agent/model-metadata-v1.json"
+              config.parent.mkdir(parents=True)
+              cache.parent.mkdir(parents=True)
+              config.write_text('{"model":"saved"}\n', encoding="utf-8")
+              cache.write_text('{"models":[]}\n', encoding="utf-8")
+              foreign = self.claude_skill(home)
+          ''',
+          )
+          replace(
+              "tests/test_installer.py",
+              '''            self.assertTrue((foreign / "foreign.txt").is_file())
+              self.assertEqual(config.read_text(encoding="utf-8"), '{"model":"saved"}\n')
+
+              def test_uninstall_with_purge_config_removes_config(self):
+          ''',
+              '''            self.assertTrue((foreign / "foreign.txt").is_file())
+              self.assertEqual(config.read_text(encoding="utf-8"), '{"model":"saved"}\n')
+              self.assertEqual(cache.read_text(encoding="utf-8"), '{"models":[]}\n')
+
+              def test_uninstall_with_purge_config_removes_config_and_cache(self):
+          ''',
+          )
+          replace(
+              "tests/test_installer.py",
+              '''            config = home / ".config/local-agent/config.json"
+              config.parent.mkdir(parents=True)
+              config.write_text('{"model":"saved"}\n', encoding="utf-8")
+
+              self.run_install(source, home, "--skills", "none")
+              self.run_install(source, home, "--uninstall", "--purge-config")
+
+              self.assertFalse(config.exists())
+          ''',
+              '''            config = home / ".config/local-agent/config.json"
+              cache = home / ".cache/local-agent/model-metadata-v1.json"
+              config.parent.mkdir(parents=True)
+              cache.parent.mkdir(parents=True)
+              config.write_text('{"model":"saved"}\n', encoding="utf-8")
+              cache.write_text('{"models":[]}\n', encoding="utf-8")
+
+              self.run_install(source, home, "--skills", "none")
+              self.run_install(source, home, "--uninstall", "--purge-config")
+
+              self.assertFalse((home / ".config/local-agent").exists())
+              self.assertFalse((home / ".cache/local-agent").exists())
+          ''',
+          )
+
+          replace(
+              "scripts/installer-smoke.sh",
+              'CONFIG_PATH="$HOME/.config/local-agent/config.json"\nZSHRC=',
+              'CONFIG_PATH="$HOME/.config/local-agent/config.json"\nCACHE_PATH="$HOME/.cache/local-agent/model-metadata-v1.json"\nZSHRC=',
+          )
+          replace(
+              "scripts/installer-smoke.sh",
+              '''mkdir -p "$(dirname "$CONFIG_PATH")"
+          printf '{"model":"saved"}\n' > "$CONFIG_PATH"
+
+          bash "$INSTALLER" --uninstall
+          ''',
+              '''mkdir -p "$(dirname "$CONFIG_PATH")" "$(dirname "$CACHE_PATH")"
+          printf '{"model":"saved"}\n' > "$CONFIG_PATH"
+          printf '{"models":[]}\n' > "$CACHE_PATH"
+
+          bash "$INSTALLER" --uninstall
+          ''',
+          )
+          replace(
+              "scripts/installer-smoke.sh",
+              '''test -f "$CONFIG_PATH"
+          if [ -f "$ZSHRC" ]; then
+          ''',
+              '''test -f "$CONFIG_PATH"
+          test -f "$CACHE_PATH"
+          if [ -f "$ZSHRC" ]; then
+          ''',
+          )
+          replace(
+              "scripts/installer-smoke.sh",
+              '''bash "$INSTALLER" --skills none
+          bash "$INSTALLER" --uninstall --purge-config
+          test ! -e "$PUBLIC_BIN"
+          test ! -e "$MANAGED_ROOT"
+          test ! -e "$HOME/.config/local-agent"
+          ''',
+              '''bash "$INSTALLER" --skills none
+          mkdir -p "$(dirname "$CONFIG_PATH")" "$(dirname "$CACHE_PATH")"
+          printf '{"model":"saved"}\n' > "$CONFIG_PATH"
+          printf '{"models":[]}\n' > "$CACHE_PATH"
+          bash "$INSTALLER" --uninstall --purge-config
+          test ! -e "$PUBLIC_BIN"
+          test ! -e "$MANAGED_ROOT"
+          test ! -e "$HOME/.config/local-agent"
+          test ! -e "$HOME/.cache/local-agent"
+          ''',
+          )
+
+          replace(
+              "README.md",
+              '''User configuration at `~/.config/local-agent/config.json` is preserved unless
+          `--purge-config` is passed. Uninstall never removes a parent skills directory
+          ''',
+              '''User configuration under `~/.config/local-agent` and cached model metadata under
+          `~/.cache/local-agent` are preserved unless `--purge-config` is passed. With
+          `--purge-config`, both directories are removed. Uninstall never removes a parent skills directory
+          ''',
+          )
+
+          replace(
+              "CHANGELOG.md",
+              "## [Unreleased]\n",
+              "## [Unreleased]\n\n### Changed\n\n* `install.sh --uninstall --purge-config` now removes both `~/.config/local-agent` and `~/.cache/local-agent`.\n",
+          )
+          PY
+
+      - name: Remove helper workflow
+        run: rm .github/workflows/apply-purge-cache-change.yml
+
+      - name: Run focused tests
+        run: |
+          python3 -m unittest tests.test_installer -v
+          bash scripts/installer-smoke.sh
+          bash -n install.sh
+
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add install.sh tests/test_installer.py scripts/installer-smoke.sh README.md CHANGELOG.md .github/workflows/apply-purge-cache-change.yml
+          git commit -m "purge local-agent cache with config"
+          git push origin HEAD:agent/purge-cache-on-uninstall
