@@ -472,24 +472,50 @@ class InstallerTests(LocalAgentTestCase):
             source = self.make_install_source(root)
             home = root / "home"
 
+            config = home / ".config/local-agent/config.json"
+            cache = home / ".cache/local-agent/model-metadata-v1.json"
+
+            config.parent.mkdir(parents=True)
+            cache.parent.mkdir(parents=True)
+
+            config.write_text('{"model":"saved"}\n', encoding="utf-8")
+            cache.write_text('{"models":[]}\n', encoding="utf-8")
+
             install_result = self.run_install(source, home, "--dry-run", "--skills", "both")
             self.assertEqual(install_result.returncode, 0)
             self.assertFalse(self.managed_root(home).exists())
             self.assertFalse(self.codex_skill(home).exists())
             self.assertFalse(self.claude_skill(home).exists())
 
-            uninstall_result = self.run_install(source, home, "--dry-run", "--uninstall")
+            uninstall_result = self.run_install(
+                source,
+                home,
+                "--dry-run",
+                "--uninstall",
+                "--purge-config",
+            )
             self.assertEqual(uninstall_result.returncode, 0)
             self.assertFalse(self.managed_root(home).exists())
+            self.assertEqual(config.read_text(encoding="utf-8"), '{"model":"saved"}\n')
+            self.assertEqual(cache.read_text(encoding="utf-8"), '{"models":[]}\n')
+            self.assertIn(str(config.parent), uninstall_result.stdout)
+            self.assertIn(str(cache.parent), uninstall_result.stdout)
 
-    def test_uninstall_removes_only_owned_skills_and_preserves_config_by_default(self):
+    def test_uninstall_removes_only_owned_skills_and_preserves_config_and_cache_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.make_install_source(root)
             home = root / "home"
+
             config = home / ".config/local-agent/config.json"
+            cache = home / ".cache/local-agent/model-metadata-v1.json"
+
             config.parent.mkdir(parents=True)
+            cache.parent.mkdir(parents=True)
+
             config.write_text('{"model":"saved"}\n', encoding="utf-8")
+            cache.write_text('{"models":[]}\n', encoding="utf-8")
+
             foreign = self.claude_skill(home)
             foreign.mkdir(parents=True)
             (foreign / "foreign.txt").write_text("keep\n", encoding="utf-8")
@@ -501,20 +527,28 @@ class InstallerTests(LocalAgentTestCase):
             self.assertFalse(self.codex_skill(home).exists())
             self.assertTrue((foreign / "foreign.txt").is_file())
             self.assertEqual(config.read_text(encoding="utf-8"), '{"model":"saved"}\n')
+            self.assertEqual(cache.read_text(encoding="utf-8"), '{"models":[]}\n')
 
-    def test_uninstall_with_purge_config_removes_config(self):
+    def test_uninstall_with_purge_config_removes_config_and_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.make_install_source(root)
             home = root / "home"
+
             config = home / ".config/local-agent/config.json"
+            cache = home / ".cache/local-agent/model-metadata-v1.json"
+
             config.parent.mkdir(parents=True)
+            cache.parent.mkdir(parents=True)
+
             config.write_text('{"model":"saved"}\n', encoding="utf-8")
+            cache.write_text('{"models":[]}\n', encoding="utf-8")
 
             self.run_install(source, home, "--skills", "none")
             self.run_install(source, home, "--uninstall", "--purge-config")
 
-            self.assertFalse(config.exists())
+            self.assertFalse((home / ".config/local-agent").exists())
+            self.assertFalse((home / ".cache/local-agent").exists())
 
     def test_missing_or_schema_one_state_is_reconstructed_from_owned_markers(self):
         with tempfile.TemporaryDirectory() as directory:

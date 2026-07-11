@@ -243,7 +243,10 @@ CI tests Python 3.10, 3.11, and 3.13 and runs Ruff, ShellCheck, CodeQL, and secr
 ./install.sh --uninstall --purge-config
 ```
 
-The uninstaller removes only toolkit-managed paths and marked integration blocks.
+The uninstaller removes only toolkit-managed paths and marked integration blocks. User
+configuration under `~/.config/local-agent` and cached model metadata under
+`~/.cache/local-agent` are preserved during a normal uninstall. Passing
+`--purge-config` removes both directories.
 
 ## License
 
