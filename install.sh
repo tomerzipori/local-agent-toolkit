@@ -2,29 +2,32 @@
 set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_DIR="${HOME}/.local/share/qwen-agent"
 BIN_DIR="${HOME}/.local/bin"
-
-mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-cp "$SOURCE_DIR/bin/qwen-agent" "$INSTALL_DIR/qwen-agent"
-chmod +x "$INSTALL_DIR/qwen-agent"
-
-for wrapper in "$SOURCE_DIR"/bin/qwen-*; do
-    name="$(basename "$wrapper")"
-    if [ "$name" = "qwen-agent" ]; then
-        continue
-    fi
-    cp "$wrapper" "$BIN_DIR/$name"
-    chmod +x "$BIN_DIR/$name"
-done
-
-ln -sf "$INSTALL_DIR/qwen-agent" "$BIN_DIR/qwen-agent"
-
+TARGET="${BIN_DIR}/local-agent"
 ZSHRC="${HOME}/.zshrc"
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
-if ! grep -Fq "$PATH_LINE" "$ZSHRC" 2>/dev/null; then
-    printf '\n# Local Qwen agent commands\n%s\n' "$PATH_LINE" >> "$ZSHRC"
+
+if [ "${1:-}" = "--uninstall" ]; then
+    rm -f "$TARGET"
+    printf 'Removed %s (configuration was kept).\n' "$TARGET"
+    exit 0
 fi
 
-printf '\nInstalled commands into %s\n' "$BIN_DIR"
-printf 'Run: source ~/.zshrc\n'
+if [ "$#" -ne 0 ]; then
+    printf 'Usage: %s [--uninstall]\n' "$0" >&2
+    exit 2
+fi
+
+mkdir -p "$BIN_DIR"
+cp "$SOURCE_DIR/bin/local-agent" "$TARGET"
+chmod +x "$TARGET"
+
+if ! grep -Fq "$PATH_LINE" "$ZSHRC" 2>/dev/null; then
+    printf '\n# Local Agent toolkit\n%s\n' "$PATH_LINE" >> "$ZSHRC"
+fi
+
+printf 'Installed %s\n' "$TARGET"
+printf 'Open a new shell or run: source ~/.zshrc\n'
+if [ -t 0 ] && [ -t 1 ]; then
+    "$TARGET" configure || printf 'Configuration skipped; run `local-agent configure` after Ollama is available.\n' >&2
+fi
