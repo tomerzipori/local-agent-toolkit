@@ -7,6 +7,7 @@ MANAGED_BIN="${INSTALL_ROOT}/bin/local-agent"
 PUBLIC_BIN="${HOME}/.local/bin/local-agent"
 STATE_FILE="${INSTALL_ROOT}/install-state.json"
 CONFIG_DIR="${HOME}/.config/local-agent"
+CACHE_DIR="${HOME}/.cache/local-agent"
 ZSHRC="${HOME}/.zshrc"
 LOCK_DIR="${HOME}/.local/state/local-agent-toolkit/install.lock"
 
@@ -681,6 +682,10 @@ if [ "$uninstall" -eq 1 ]; then
             remove_tree "$CONFIG_DIR"
             removed_any=1
         fi
+        if path_exists "$CACHE_DIR"; then
+            remove_tree "$CACHE_DIR"
+            removed_any=1
+        fi
     fi
     if [ "$dry_run" -eq 1 ]; then
         note 'Dry run complete; no files were modified.'
@@ -688,9 +693,9 @@ if [ "$uninstall" -eq 1 ]; then
         if [ "$removed_any" -eq 0 ]; then
             note 'No prior installation found.'
         elif [ "$purge_config" -eq 1 ]; then
-            note 'Removed toolkit-managed binary, owned skills, managed blocks, and local-agent configuration.'
+            note 'Removed toolkit-managed binary, owned skills, managed blocks, local-agent configuration, and cache.'
         else
-            note 'Removed toolkit-managed binary, owned skills, and managed blocks (configuration was kept).'
+            note 'Removed toolkit-managed binary, owned skills, and managed blocks (configuration and cache were kept).'
         fi
     fi
     exit 0

@@ -6,6 +6,11 @@ The project follows semantic versioning. Because the project is still before ver
 
 ## [Unreleased]
 
+### Changed
+
+- `install.sh --uninstall --purge-config` now removes both
+  `~/.config/local-agent` and `~/.cache/local-agent`.
+
 ## [0.1.0] - 2026-07-11
 
 Initial public release of Local Agent Toolkit.

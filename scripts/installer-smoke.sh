@@ -13,6 +13,7 @@ INSTALLER="$ROOT/install.sh"
 PUBLIC_BIN="$HOME/.local/bin/local-agent"
 MANAGED_ROOT="$HOME/.local/share/local-agent-toolkit"
 CONFIG_PATH="$HOME/.config/local-agent/config.json"
+CACHE_PATH="$HOME/.cache/local-agent/model-metadata-v1.json"
 ZSHRC="$HOME/.zshrc"
 CODEX_SKILL="$HOME/.agents/skills/local-agent-toolkit"
 CLAUDE_SKILL="$HOME/.claude/skills/local-agent-toolkit"
@@ -30,8 +31,9 @@ REPEAT_OUTPUT="$(bash "$INSTALLER" --skills both)"
 printf '%s' "$REPEAT_OUTPUT" | grep -F "reinstall confirmation requires an interactive terminal"
 test "$(local-agent --version)" = "local-agent $EXPECTED_VERSION"
 
-mkdir -p "$(dirname "$CONFIG_PATH")"
+mkdir -p "$(dirname "$CONFIG_PATH")" "$(dirname "$CACHE_PATH")"
 printf '{"model":"saved"}\n' > "$CONFIG_PATH"
+printf '{"models":[]}\n' > "$CACHE_PATH"
 
 bash "$INSTALLER" --uninstall
 test ! -e "$PUBLIC_BIN"
@@ -39,6 +41,7 @@ test ! -e "$MANAGED_ROOT"
 test ! -e "$CODEX_SKILL"
 test ! -e "$CLAUDE_SKILL"
 test -f "$CONFIG_PATH"
+test -f "$CACHE_PATH"
 if [ -f "$ZSHRC" ]; then
     if grep -Fq 'BEGIN LOCAL-AGENT TOOLKIT PATH' "$ZSHRC"; then
         exit 1
@@ -46,10 +49,16 @@ if [ -f "$ZSHRC" ]; then
 fi
 
 bash "$INSTALLER" --skills none
+
+mkdir -p "$(dirname "$CONFIG_PATH")" "$(dirname "$CACHE_PATH")"
+printf '{"model":"saved"}\n' > "$CONFIG_PATH"
+printf '{"models":[]}\n' > "$CACHE_PATH"
+
 bash "$INSTALLER" --uninstall --purge-config
 test ! -e "$PUBLIC_BIN"
 test ! -e "$MANAGED_ROOT"
 test ! -e "$HOME/.config/local-agent"
+test ! -e "$HOME/.cache/local-agent"
 
 mkdir -p "$(dirname "$PUBLIC_BIN")"
 printf 'foreign command\n' > "$PUBLIC_BIN"
