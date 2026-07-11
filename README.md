@@ -1,10 +1,21 @@
 ![Cover Image](assets/cover.png)
 # Local Agent toolkit
 
-`local-agent` is a macOS-focused, dependency-free Python 3.10+ command for bounded
+`local-agent` is a macOS-focused, dependency-free Python command for bounded
 coding assistance through a model installed in Ollama. Model output is
 untrusted advice: the parent agent must independently verify patches, commands,
 paths, and all test claims.
+
+## Supported Python
+
+The supported runtime range is currently:
+
+- 3.10 minimum supported version
+- 3.11 actively tested midpoint
+- 3.13 newest supported version
+
+Ubuntu CI runs the full `3.10`, `3.11`, and `3.13` matrix. macOS CI runs the
+release-critical installer and unit-test coverage on `3.10` and `3.13`.
 
 ## Install
 
@@ -169,11 +180,17 @@ local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
 
 ## Development
 
-This project uses only the Python standard library:
+Local checks:
+
+```bash
+bash scripts/check.sh
+```
+
+If you only want the unit suite:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The repository intentionally has no license yet; choose one before making it
-public.
+The current executable version is `0.1.0`, with `bin/local-agent` remaining the
+single source of truth until packaging becomes necessary.

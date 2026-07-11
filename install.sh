@@ -11,7 +11,7 @@ ZSHRC="${HOME}/.zshrc"
 
 PATH_BLOCK_START='# BEGIN LOCAL-AGENT TOOLKIT PATH'
 PATH_BLOCK_END='# END LOCAL-AGENT TOOLKIT PATH'
-PATH_EXPORT='export PATH="$HOME/.local/bin:$PATH"'
+PATH_EXPORT="export PATH=\"\$HOME/.local/bin:\$PATH\""
 
 INSTRUCTION_START='<!-- BEGIN LOCAL-AGENT TOOLKIT -->'
 INSTRUCTION_END='<!-- END LOCAL-AGENT TOOLKIT -->'
@@ -445,5 +445,5 @@ if [ "$instructions" != "none" ]; then
     note 'Restart existing Codex or Claude sessions to load updated instructions.'
 fi
 if [ -t 0 ] && [ -t 1 ]; then
-    "$PUBLIC_BIN" configure || printf 'Configuration skipped; run `local-agent configure` after Ollama is available.\n' >&2
+    "$PUBLIC_BIN" configure || printf "Configuration skipped; run \`local-agent configure\` after Ollama is available.\n" >&2
 fi

@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import urlparse
 
-VERSION = "1.0.0"
+VERSION = "0.1.0"
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_NUM_CTX = 32768
 DEFAULT_MAX_CHARS = 120_000
 DEFAULT_MAX_FILE_BYTES = 256_000
 DEFAULT_MAX_CONTEXT_FILES = 200
+MAX_OLLAMA_RESPONSE_BYTES = 5_000_000
 CONFIG_SCHEMA_VERSION = 1
 MODELS_JSON_SCHEMA_VERSION = 1
 CONFIG_PATH = Path("~/.config/local-agent/config.json")
@@ -486,7 +487,12 @@ def request_json(
     )
     try:
         with urllib.request.urlopen(request, timeout=3600) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            raw = response.read(MAX_OLLAMA_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_OLLAMA_RESPONSE_BYTES:
+                raise RuntimeError(
+                    f"Ollama returned more than {MAX_OLLAMA_RESPONSE_BYTES} bytes at {host}{endpoint}."
+                )
+            result = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Ollama returned HTTP {exc.code} at {host}{endpoint}: {detail}") from exc
@@ -1382,12 +1388,18 @@ def main(argv: list[str] | None = None) -> int:
             allow_insecure_remote_host=args.allow_insecure_remote_host,
         )
         if args.save:
-            Path(args.save).write_text(result + "\n", encoding="utf-8")
+            save_path = Path(args.save)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_text(result + "\n", encoding="utf-8")
         print(result)
         if collection.command_status:
             print(f"local-agent: fix-test command exited with status {collection.command_status}", file=sys.stderr)
             return collection.command_status
         return 0
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
     except (RuntimeError, OSError) as exc:
         print(f"local-agent: {exc}", file=sys.stderr)
         return 2 if isinstance(exc, UsageError) else 1

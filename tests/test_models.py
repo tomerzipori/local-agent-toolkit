@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+from unittest import mock
+
+from tests.helpers import (
+    LocalAgentTestCase,
+    OllamaServer,
+    RawResponseServer,
+    local_agent,
+    temporary_home,
+    unused_local_port,
+)
+
+
+class ModelTests(LocalAgentTestCase):
+    def test_model_discovery_and_generate_payload(self):
+        with OllamaServer({"models": [{"name": "model:latest"}]}) as server:
+            self.assertEqual(local_agent.discover_models(server.host), ["model:latest"])
+            side_effect = [{"models": [{"name": "model:latest"}]}, {"response": " answer "}]
+            with mock.patch.object(local_agent, "request_json", side_effect=side_effect) as request:
+                result = local_agent.call_ollama(
+                    "prompt", local_agent.Settings("model:latest", server.host, 123, 456)
+                )
+            self.assertEqual(result, "answer")
+            payload = request.call_args_list[1].args[2]
+            self.assertEqual(payload["model"], "model:latest")
+            self.assertEqual(payload["options"]["num_ctx"], 123)
+            self.assertFalse(payload["stream"])
+
+    def test_enriched_model_inventory_uses_tags_and_show_and_fills_optional_metadata(self):
+        with mock.patch.object(
+            local_agent,
+            "request_json",
+            side_effect=[
+                {
+                    "models": [
+                        {"name": "coder:latest", "size": 123, "details": {"family": "tags-family"}},
+                        {"name": "small:latest"},
+                    ]
+                },
+                {
+                    "details": {
+                        "family": "llama",
+                        "families": ["llama"],
+                        "parameter_size": "7B",
+                        "quantization_level": "Q4_K_M",
+                    },
+                    "capabilities": ["completion"],
+                    "model_info": {"llama.context_length": 8192},
+                },
+                {"details": {}, "model_info": {}},
+            ],
+        ) as request:
+            inventory = local_agent.model_inventory("http://host")
+
+        self.assertEqual(
+            inventory,
+            [
+                {
+                    "name": "coder:latest",
+                    "size_bytes": 123,
+                    "family": "llama",
+                    "families": ["llama"],
+                    "parameter_size": "7B",
+                    "quantization": "Q4_K_M",
+                    "capabilities": ["completion"],
+                    "context_length": 8192,
+                },
+                {
+                    "name": "small:latest",
+                    "size_bytes": None,
+                    "family": None,
+                    "families": [],
+                    "parameter_size": None,
+                    "quantization": None,
+                    "capabilities": [],
+                    "context_length": None,
+                },
+            ],
+        )
+        self.assertEqual(
+            request.call_args_list[1].args[1:], ("/api/show", {"model": "coder:latest"})
+        )
+        self.assertEqual(
+            request.call_args_list[2].args[1:], ("/api/show", {"model": "small:latest"})
+        )
+
+    def test_model_inventory_propagates_show_api_failures(self):
+        with mock.patch.object(
+            local_agent,
+            "request_json",
+            side_effect=[
+                {"models": [{"name": "model:latest"}]},
+                RuntimeError("Ollama returned HTTP 404"),
+            ],
+        ):
+            message = self._error(local_agent.model_inventory, "http://host")
+        self.assertIn("HTTP 404", message)
+
+    def test_models_json_reports_default_and_plain_output_is_unchanged(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            side_effect = [
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]
+            with (
+                mock.patch.object(local_agent, "request_json", side_effect=side_effect),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["host"], "http://host")
+            self.assertEqual(payload["default_model"], "coder:latest")
+            self.assertEqual(payload["models"][0]["name"], "coder:latest")
+
+            with (
+                mock.patch.object(
+                    local_agent, "request_json", return_value={"models": [{"name": "coder:latest"}]}
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                status = local_agent.main(["models", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            self.assertEqual(stdout.getvalue(), "coder:latest\n")
+
+    def test_empty_models_missing_ollama_and_api_error(self):
+        with OllamaServer({"models": []}) as server:
+            message = self._error(local_agent.discover_models, server.host)
+            self.assertIn("No Ollama models are installed", message)
+        message = self._error(
+            local_agent.discover_models, f"http://127.0.0.1:{unused_local_port()}"
+        )
+        self.assertIn("Could not reach Ollama", message)
+        with OllamaServer({"error": "bad request"}, status=500) as server:
+            message = self._error(local_agent.discover_models, server.host)
+            self.assertIn("HTTP 500", message)
+
+    def test_stale_model_is_rejected(self):
+        with mock.patch.object(local_agent, "discover_models", return_value=["new"]):
+            message = self._error(
+                local_agent.call_ollama, "prompt", local_agent.Settings("old", "host", 1, 1)
+            )
+        self.assertIn("is not installed", message)
+
+    def test_models_json_contains_schema_version(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            side_effect = [
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]
+            with (
+                mock.patch.object(local_agent, "request_json", side_effect=side_effect),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(stdout.getvalue())["schema_version"], 1)
+
+    def test_models_json_contract_remains_stable(self):
+        with temporary_home():
+            local_agent.save_config({"model": "coder:latest"})
+            side_effect = [
+                {"models": [{"name": "coder:latest", "size": 10}]},
+                {"details": {}, "capabilities": [], "model_info": {}},
+            ]
+            with (
+                mock.patch.object(local_agent, "request_json", side_effect=side_effect),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                status = local_agent.main(["models", "--json", "--host", "http://host"])
+            self.assertEqual(status, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(set(payload), {"schema_version", "host", "default_model", "models"})
+            self.assertEqual(
+                set(payload["models"][0]),
+                {
+                    "name",
+                    "size_bytes",
+                    "family",
+                    "families",
+                    "parameter_size",
+                    "quantization",
+                    "capabilities",
+                    "context_length",
+                },
+            )
+
+    def test_localhost_does_not_require_remote_consent(self):
+        self.assertEqual(local_agent.classify_host("http://localhost:11434"), "local")
+        local_agent.ensure_host_allowed("http://localhost:11434", allow_remote_host=False)
+
+    def test_loopback_ip_does_not_require_remote_consent(self):
+        self.assertEqual(local_agent.classify_host("http://127.0.0.1:11434"), "local")
+        self.assertEqual(local_agent.classify_host("http://[::1]:11434"), "local")
+        local_agent.ensure_host_allowed("http://127.0.0.1:11434", allow_remote_host=False)
+
+    def test_remote_https_requires_consent(self):
+        message = self._error(local_agent.ensure_host_allowed, "https://example.com", False, False)
+        self.assertIn("--allow-remote-host", message)
+
+    def test_remote_http_requires_insecure_consent(self):
+        message = self._error(local_agent.ensure_host_allowed, "http://example.com", True, False)
+        self.assertIn("--allow-insecure-remote-host", message)
+
+    def test_url_with_credentials_is_rejected(self):
+        message = self._error(local_agent.normalize_host, "http://user:pass@example.com")
+        self.assertIn("embedded credentials", message)
+
+    def test_ollama_invalid_utf8_response(self):
+        with RawResponseServer(b"\xff\xfe") as server:
+            message = self._error(local_agent.request_json, server.host, "/api/tags")
+        self.assertIn("invalid JSON", message)
+
+    def test_ollama_response_body_size_limit(self):
+        payload = b"{" + b'"' + b"a" * local_agent.MAX_OLLAMA_RESPONSE_BYTES + b'":1}'
+        with RawResponseServer(payload) as server:
+            message = self._error(local_agent.request_json, server.host, "/api/tags")
+        self.assertIn("more than", message)
