@@ -34,6 +34,16 @@ def temporary_home():
             yield Path(home)
 
 
+@contextlib.contextmanager
+def temporary_cwd(path: Path):
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
 class OllamaServer:
     def __init__(self, response: dict[str, object], status: int = 200):
         self.response = response
@@ -90,6 +100,20 @@ class LocalAgentTests(unittest.TestCase):
         self.assertIn("Review the supplied", local_agent.build_prompt("review-branch", "task", "", 1000)[0])
         self.assertEqual(local_agent.build_parser().parse_args(["models"]).mode, "models")
         self.assertEqual(local_agent.build_parser().parse_args(["configure"]).mode, "configure")
+
+    def test_diagnose_and_impact_have_distinct_prompts_and_help(self):
+        parser = local_agent.build_parser()
+        self.assertEqual(parser.parse_args(["diagnose", "failure", "error.log", "--stdin"]).mode, "diagnose")
+        self.assertEqual(parser.parse_args(["impact", "change retry behavior"]).mode, "impact")
+        diagnose_prompt, _ = local_agent.build_prompt("diagnose", "failure", "output", 1000)
+        impact_prompt, _ = local_agent.build_prompt("impact", "change", "diff", 1000)
+        self.assertIn("Evidence versus hypotheses", diagnose_prompt)
+        self.assertIn("Suggested verification", diagnose_prompt)
+        self.assertIn("Affected files and symbols", impact_prompt)
+        self.assertIn("Compatibility risks", impact_prompt)
+        help_output = parser.format_help()
+        self.assertIn("diagnose", help_output)
+        self.assertIn("impact", help_output)
 
     def test_configuration_precedence_cli_then_environment_then_saved(self):
         with temporary_home():
@@ -177,6 +201,79 @@ class LocalAgentTests(unittest.TestCase):
             truncated, was_truncated = local_agent.truncate_context("x" * 100, 40)
             self.assertTrue(was_truncated)
             self.assertIn("TRUNCATED TO 40", truncated)
+
+    def test_diagnose_reads_stdin_and_files_without_subprocesses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.py"
+            source.write_text("raise RuntimeError('broken')")
+            args = SimpleNamespace(
+                mode="diagnose",
+                task="Explain the failure",
+                files=[str(source)],
+                stdin=True,
+                allow_outside_repo=False,
+            )
+            with temporary_cwd(Path(directory)), mock.patch("sys.stdin", io.StringIO("CI: RuntimeError")), mock.patch.object(
+                local_agent.subprocess, "run", side_effect=AssertionError("diagnose ran a subprocess")
+            ):
+                context, status = local_agent.collect_context(args)
+            self.assertIsNone(status)
+            self.assertIn("CI: RuntimeError", context)
+            self.assertIn("raise RuntimeError('broken')", context)
+
+    def test_impact_collects_repository_search_and_both_diffs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            tracked = repo / "retry.py"
+            tracked.write_text("def retry_request():\n    return 'initial'\n")
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "add", "retry.py"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            args = SimpleNamespace(
+                mode="impact",
+                task="Assess retry_request behavior",
+                files=[],
+                stdin=False,
+                allow_outside_repo=False,
+            )
+            with temporary_cwd(repo):
+                clean_context, status = local_agent.collect_context(args)
+            self.assertIsNone(status)
+            self.assertNotIn("===== STAGED DIFF =====", clean_context)
+            self.assertNotIn("===== UNSTAGED DIFF =====", clean_context)
+            tracked.write_text("def retry_request():\n    return 'staged change'\n")
+            subprocess.run(["git", "add", "retry.py"], cwd=repo, check=True)
+            tracked.write_text("def retry_request():\n    return 'unstaged change'\n")
+            with temporary_cwd(repo):
+                context, status = local_agent.collect_context(args)
+            self.assertIsNone(status)
+            self.assertIn("===== REPOSITORY FILE LIST =====", context)
+            self.assertIn("retry.py", context)
+            self.assertIn("===== REPOSITORY SEARCH =====", context)
+            self.assertIn("retry_request", context)
+            self.assertIn("===== STAGED DIFF =====", context)
+            self.assertIn("staged change", context)
+            self.assertIn("===== UNSTAGED DIFF =====", context)
+            self.assertIn("unstaged change", context)
+
+    def test_impact_requires_a_git_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                mode="impact",
+                task="Assess impact",
+                files=[],
+                stdin=False,
+                allow_outside_repo=False,
+            )
+            with temporary_cwd(Path(directory)):
+                message = self._error(local_agent.collect_context, args)
+            self.assertIn("inside a Git repository", message)
 
     def test_default_branch_prefers_remote_default_then_local_fallback(self):
         with mock.patch.object(local_agent, "run_git", side_effect=["origin/develop\n"]):

@@ -58,7 +58,9 @@ local-agent review-staged "Pre-commit correctness review"
 local-agent review-branch "Review before opening an MR" --base origin/main
 local-agent test-plan "Tests for deterministic package sampling" src/sampling.py
 local-agent write-tests "Add regression tests for duplicate IDs" src/sampling.py tests/test_sampling.py
+local-agent diagnose "Explain this CI failure" --stdin tests/test_sampling.py
 local-agent fix-test "Diagnose and propose a minimal fix" --command 'pytest tests/test_sampling.py -x' src/sampling.py
+local-agent impact "Assess the blast radius of changing retry behavior" src/retry.py tests/test_retry.py
 git diff | local-agent second-opinion --stdin "Challenge the design choices in this diff"
 local-agent patch "Add validation for empty insight names" src/config.py tests/test_config.py
 ```
@@ -71,6 +73,10 @@ is an explicit escape hatch. Large context is truncated with an in-prompt notice
 `fix-test` deliberately executes the supplied local shell command. Its combined
 output and exit status are included in the model context, and a nonzero command
 status is returned after the model response.
+
+`diagnose` inspects supplied failure output and file or stdin context without
+executing a command. `impact` requires a Git repository and includes its file
+map, targeted search results, and any staged or unstaged diff.
 
 ## Codex and Claude Code
 

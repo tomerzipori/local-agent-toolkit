@@ -10,7 +10,9 @@ A local Ollama coding worker is available through one command:
 - `local-agent review-branch "<focus>" [--base <branch>]`
 - `local-agent test-plan "<task>" <file...>`
 - `local-agent write-tests "<task>" <implementation-file> <test-file>`
+- `local-agent diagnose "<failure or CI output>" [file...] [--stdin]`
 - `local-agent fix-test "<task>" --command '<test command>' <file...>`
+- `local-agent impact "<task>" [file...]`
 - `local-agent second-opinion "<claim or proposal>" [file...]`
 - `local-agent patch "<task>" <file...>`
 
