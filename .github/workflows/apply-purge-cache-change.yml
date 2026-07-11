@@ -1,0 +1,23 @@
+name: Apply purge cache change
+
+on:
+  push:
+    branches:
+      - agent/purge-cache-on-uninstall
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/purge-cache-on-uninstall
+          fetch-depth: 0
+
+      - name: Apply implementation
+        shell: bash
+        run: |
