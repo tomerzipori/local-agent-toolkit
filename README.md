@@ -70,7 +70,9 @@ export LOCAL_AGENT_MAX_CHARS='120000'
 
 If `LOCAL_AGENT_HOST` points to a non-local Ollama server, supplied source code
 is sent to that server. Keep the host local when source privacy matters, or
-pass `--allow-remote-host` explicitly when remote use is intentional.
+pass `--allow-remote-host` explicitly when remote use is intentional. Remote
+HTTP hosts additionally require `--allow-insecure-remote-host`. Hosts with
+embedded credentials are rejected.
 
 `local-agent configure` is interactive only when stdin and stdout are terminals.
 Use `local-agent configure --show` to print the effective settings and their
@@ -103,9 +105,28 @@ local-agent patch "Add validation for empty insight names" src/config.py tests/t
 ```
 
 `review-branch` detects the repository's remote default branch, then falls back
-to `main` and `master`; `--base` is authoritative. File context is repository
-bound by default, binary files and symlinks are skipped, and `--allow-outside-repo`
-is an explicit escape hatch. Large context is truncated with an in-prompt notice.
+to `main` and `master`; `--base` is authoritative.
+
+Context collection is now policy-driven:
+
+- Explicit tracked files are included by default.
+- Directories expand to Git-tracked files only by default.
+- Explicit untracked files require `--include-untracked`.
+- Ignored files require `--include-ignored`.
+- Sensitive paths such as `.env`, private keys, `.ssh/*`, and
+  `credentials.json` require `--allow-sensitive-files`.
+- Files outside the current repository still require `--allow-outside-repo`.
+- Symlinks, binary files, and oversized files are skipped with explicit reasons.
+- `--max-file-bytes` defaults to `256000`.
+- `--max-context-files` defaults to `200`.
+
+Use `--show-context-files` to print the exact context-file manifest and exit
+without contacting Ollama. Normal runs print a concise stderr summary of how
+many files and characters are being sent, plus how many files were skipped.
+
+Ignored files are not included automatically, even when explicitly named,
+because `.gitignore` commonly covers build artifacts, local secrets, and other
+non-reviewable workspace data.
 
 `fix-test` deliberately executes the supplied local shell command. Its combined
 output and exit status are included in the model context, and a nonzero command
