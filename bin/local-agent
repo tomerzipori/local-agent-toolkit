@@ -7,12 +7,15 @@ import fnmatch
 import ipaddress
 import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import urlparse
@@ -25,9 +28,18 @@ DEFAULT_MAX_FILE_BYTES = 256_000
 DEFAULT_MAX_CONTEXT_FILES = 200
 MAX_OLLAMA_RESPONSE_BYTES = 5_000_000
 CONFIG_SCHEMA_VERSION = 1
-MODELS_JSON_SCHEMA_VERSION = 1
+MODELS_JSON_SCHEMA_VERSION = 2
+RECOMMENDATION_JSON_SCHEMA_VERSION = 1
 CONFIG_PATH = Path("~/.config/local-agent/config.json")
+MODEL_METADATA_CACHE_PATH = Path("~/.cache/local-agent/model-metadata-v1.json")
 CONFIG_FIELDS = ("model", "host", "num_ctx", "max_chars")
+KIB = 1024
+MIB = KIB * 1024
+GIB = MIB * 1024
+MIN_SYSTEM_RESERVE_BYTES = 4 * GIB
+SYSTEM_RESERVE_RATIO = 0.15
+SAFE_HEADROOM_RATIO = 0.10
+MIN_SAFE_HEADROOM_BYTES = 2 * GIB
 SENSITIVE_BASENAMES = {
     ".env",
     "id_rsa",
@@ -237,6 +249,80 @@ TASK:
 
 MODES = tuple(PROMPTS)
 COMMANDS = MODES + ("review-staged", "review-branch")
+FAST_COMMANDS = {"find", "files", "diagnose", "impact"}
+BALANCED_COMMANDS = {"plan", "test-plan", "second-opinion"}
+STRONG_COMMANDS = {"review", "review-staged", "review-branch", "write-tests", "fix-test", "patch"}
+QUALITY_PROFILES = ("fast", "balanced", "strong")
+
+
+@dataclass(frozen=True)
+class QuantizationInfo:
+    raw: str | None
+    approximate_bits: float | None
+    quality_rank: int | None
+
+
+@dataclass(frozen=True)
+class InstalledModel:
+    name: str
+    digest: str | None
+    size_bytes: int | None
+    family: str | None
+    families: tuple[str, ...]
+    parameter_size: str | None
+    parameter_count: int | None
+    quantization: str | None
+    capabilities: tuple[str, ...]
+    context_length: int | None
+    coding_signal: str
+    base_model_key: str | None
+    quantization_rank: int | None
+    kv_bytes_per_token_f16: int | None
+
+
+@dataclass(frozen=True)
+class RunningModel:
+    name: str
+    digest: str | None
+    loaded_size_bytes: int | None
+    loaded_vram_bytes: int | None
+    loaded_context_length: int | None
+    expires_at: str | None
+
+
+@dataclass(frozen=True)
+class SystemMemory:
+    platform: str
+    architecture: str
+    memory_model: str
+    total_bytes: int | None
+    available_bytes: int | None
+    protected_reserve_bytes: int | None
+    model_budget_bytes: int | None
+    confidence: str
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ModelMemoryEstimate:
+    status: str
+    weights_bytes: int | None
+    runtime_overhead_bytes: int | None
+    kv_cache_bytes: int | None
+    estimated_required_bytes: int | None
+    estimated_headroom_bytes: int | None
+    confidence: str
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ModelCandidate:
+    installed: InstalledModel
+    running: RunningModel | None
+    memory: ModelMemoryEstimate
+    profile: str
+    ranking_key: tuple[object, ...]
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -533,6 +619,83 @@ def _model_details(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def model_metadata_cache_path() -> Path:
+    return Path(os.path.expanduser(str(MODEL_METADATA_CACHE_PATH)))
+
+
+def _cache_key(name: str, digest: str | None) -> str:
+    return f"{name}@{digest or 'unknown'}"
+
+
+def _str_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item) for item in value if isinstance(item, str))
+
+
+def parse_parameter_count(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([BM])\s*", value, flags=re.IGNORECASE)
+    if not match:
+        return None
+    multiplier = 1_000_000_000 if match.group(2).upper() == "B" else 1_000_000
+    return int(float(match.group(1)) * multiplier)
+
+
+def parse_quantization(value: str | None) -> QuantizationInfo:
+    if not value:
+        return QuantizationInfo(None, None, None)
+    raw = value.upper()
+    table: dict[str, tuple[float, int]] = {
+        "F16": (16.0, 9),
+        "BF16": (16.0, 9),
+        "Q8_0": (8.0, 8),
+        "Q6_K": (6.0, 7),
+        "Q5_K_M": (5.0, 6),
+        "Q4_K_M": (4.0, 5),
+        "Q4_0": (4.0, 4),
+        "IQ4_XS": (4.0, 4),
+        "Q3_K_M": (3.0, 3),
+        "IQ3_M": (3.0, 3),
+        "Q2_K": (2.0, 2),
+        "IQ2_XXS": (2.0, 2),
+        "IQ1_M": (1.0, 1),
+        "UD-IQ1_M": (1.0, 1),
+    }
+    if raw in table:
+        bits, rank = table[raw]
+        return QuantizationInfo(value, bits, rank)
+    match = re.search(r"(?:^|[-_])(?:UD-)?I?Q(\d)(?:[._-]|$)", raw)
+    if match:
+        bits = float(match.group(1))
+        return QuantizationInfo(value, bits, max(1, min(8, int(bits))))
+    return QuantizationInfo(value, None, None)
+
+
+def classify_coding_signal(name: str, capabilities: tuple[str, ...], family: str | None) -> str:
+    haystack = " ".join([name, family or "", *capabilities]).lower()
+    if "embedding" in haystack and "completion" not in haystack and "generate" not in haystack:
+        return "unsuitable"
+    if any(marker in haystack for marker in ("code", "coder", "codestral", "devstral", "starcoder")):
+        return "strong"
+    if "completion" in haystack or "generate" in haystack or capabilities:
+        return "generic"
+    return "unknown"
+
+
+def base_model_key(name: str, family: str | None, parameter_size: str | None, quantization: str | None) -> str | None:
+    normalized = name.lower()
+    normalized = normalized.split("/", maxsplit=10)[-1]
+    normalized = normalized.rsplit(":", maxsplit=1)[0]
+    if quantization:
+        normalized = normalized.replace(quantization.lower(), "")
+    normalized = re.sub(r"\b(f16|bf16|q\d(?:_[a-z0-9]+)*|iq\d(?:_[a-z0-9]+)*|ud-iq\d(?:_[a-z0-9]+)*)\b", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    parts = [part for part in (family, parameter_size, normalized) if part]
+    return "-".join(str(part).lower() for part in parts) if parts else None
+
+
 def _context_length(model_info: object) -> int | None:
     if not isinstance(model_info, dict):
         return None
@@ -542,9 +705,27 @@ def _context_length(model_info: object) -> int | None:
     return None
 
 
-def model_inventory(
-    host: str, allow_remote_host: bool = False, allow_insecure_remote_host: bool = False
-) -> list[dict[str, object]]:
+def _model_info_int(model_info: dict[str, object], suffix: str) -> int | None:
+    for key, value in model_info.items():
+        if str(key).endswith(suffix) and isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def kv_bytes_per_token_f16(model_info: object) -> int | None:
+    if not isinstance(model_info, dict):
+        return None
+    block_count = _model_info_int(model_info, ".block_count")
+    embedding_length = _model_info_int(model_info, ".embedding_length")
+    head_count = _model_info_int(model_info, ".attention.head_count")
+    kv_head_count = _model_info_int(model_info, ".attention.head_count_kv") or head_count
+    if not block_count or not embedding_length or not head_count or not kv_head_count:
+        return None
+    head_dimension = embedding_length / head_count
+    return int(2 * block_count * kv_head_count * head_dimension * 2)
+
+
+def _tagged_models(host: str, allow_remote_host: bool, allow_insecure_remote_host: bool) -> list[dict[str, object]]:
     result = request_json(
         host,
         "/api/tags",
@@ -559,39 +740,750 @@ def model_inventory(
         raise RuntimeError(
             f"No Ollama models are installed at {host}. Run `ollama pull <model>` and try again."
         )
+    return tagged_models
 
-    inventory: list[dict[str, object]] = []
-    for tagged in tagged_models:
+
+def _cache_entry_to_model(tagged: dict[str, object], entry: dict[str, object]) -> InstalledModel:
+    details = _model_details(tagged.get("details"))
+    name = str(tagged["name"])
+    digest = tagged.get("digest") if isinstance(tagged.get("digest"), str) else None
+    size_bytes = tagged.get("size") if isinstance(tagged.get("size"), int) else None
+    families = entry.get("families")
+    capabilities = entry.get("capabilities")
+    return InstalledModel(
+        name=name,
+        digest=digest,
+        size_bytes=size_bytes,
+        family=entry.get("family") if isinstance(entry.get("family"), str) else (
+            details.get("family") if isinstance(details.get("family"), str) else None
+        ),
+        families=tuple(str(item) for item in families) if isinstance(families, list) else (),
+        parameter_size=entry.get("parameter_size") if isinstance(entry.get("parameter_size"), str) else None,
+        parameter_count=entry.get("parameter_count") if isinstance(entry.get("parameter_count"), int) else None,
+        quantization=entry.get("quantization") if isinstance(entry.get("quantization"), str) else None,
+        capabilities=tuple(str(item) for item in capabilities) if isinstance(capabilities, list) else (),
+        context_length=entry.get("context_length") if isinstance(entry.get("context_length"), int) else None,
+        coding_signal=entry.get("coding_signal") if entry.get("coding_signal") in {"strong", "generic", "unsuitable", "unknown"} else "unknown",
+        base_model_key=entry.get("base_model_key") if isinstance(entry.get("base_model_key"), str) else None,
+        quantization_rank=entry.get("quantization_rank") if isinstance(entry.get("quantization_rank"), int) else None,
+        kv_bytes_per_token_f16=entry.get("kv_bytes_per_token_f16") if isinstance(entry.get("kv_bytes_per_token_f16"), int) else None,
+    )
+
+
+def _metadata_entry(name: str, tagged: dict[str, object], shown: dict[str, object]) -> dict[str, object]:
+    tagged_details = _model_details(tagged.get("details"))
+    shown_details = _model_details(shown.get("details"))
+    details = {**tagged_details, **shown_details}
+    family = details.get("family") if isinstance(details.get("family"), str) else None
+    families = _str_tuple(details.get("families"))
+    parameter_size = details.get("parameter_size") if isinstance(details.get("parameter_size"), str) else None
+    quantization = details.get("quantization_level") if isinstance(details.get("quantization_level"), str) else None
+    capabilities = _str_tuple(shown.get("capabilities"))
+    quantization_info = parse_quantization(quantization)
+    model_info = shown.get("model_info")
+    return {
+        "name": name,
+        "digest": tagged.get("digest") if isinstance(tagged.get("digest"), str) else None,
+        "family": family,
+        "families": list(families),
+        "parameter_size": parameter_size,
+        "parameter_count": parse_parameter_count(parameter_size),
+        "quantization": quantization,
+        "quantization_rank": quantization_info.quality_rank,
+        "capabilities": list(capabilities),
+        "context_length": _context_length(model_info),
+        "coding_signal": classify_coding_signal(name, capabilities, family),
+        "base_model_key": base_model_key(name, family, parameter_size, quantization),
+        "kv_bytes_per_token_f16": kv_bytes_per_token_f16(model_info),
+    }
+
+
+def load_metadata_cache() -> tuple[dict[str, object], list[str]]:
+    path = model_metadata_cache_path()
+    if not path.exists():
+        return {"schema_version": 1, "models": {}}, []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"schema_version": 1, "models": {}}, [f"Metadata cache could not be read: {exc}"]
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("models"), dict):
+        return {"schema_version": 1, "models": {}}, ["Metadata cache had an unsupported shape and was ignored."]
+    return payload, []
+
+
+def save_metadata_cache(payload: dict[str, object]) -> str | None:
+    path = model_metadata_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        os.replace(temp_path, path)
+    except OSError as exc:
+        try:
+            os.unlink(temp_path)  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
+        return f"Metadata cache could not be written: {exc}"
+    return None
+
+
+def installed_model_inventory(
+    host: str,
+    *,
+    allow_remote_host: bool = False,
+    allow_insecure_remote_host: bool = False,
+    refresh: bool = False,
+    performance: dict[str, object] | None = None,
+) -> tuple[list[InstalledModel], list[str]]:
+    started = time.perf_counter()
+    tagged_models = _tagged_models(host, allow_remote_host, allow_insecure_remote_host)
+    if performance is not None:
+        performance["tags_duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    cache, warnings = load_metadata_cache()
+    cached_models = cache.get("models")
+    assert isinstance(cached_models, dict)
+    next_cache: dict[str, object] = {}
+    inventory: list[InstalledModel] = []
+    hits = 0
+    misses = 0
+    show_requests = 0
+    for tagged in sorted(tagged_models, key=lambda item: str(item.get("name", ""))):
         name = str(tagged["name"])
-        tagged_details = _model_details(tagged.get("details"))
-        shown = request_json(
-            host,
-            "/api/show",
-            {"model": name},
-            allow_remote_host=allow_remote_host,
-            allow_insecure_remote_host=allow_insecure_remote_host,
+        digest = tagged.get("digest") if isinstance(tagged.get("digest"), str) else None
+        key = _cache_key(name, digest)
+        entry = cached_models.get(key)
+        if refresh or not isinstance(entry, dict):
+            misses += 1
+            show_started = time.perf_counter()
+            shown = request_json(
+                host,
+                "/api/show",
+                {"model": name},
+                allow_remote_host=allow_remote_host,
+                allow_insecure_remote_host=allow_insecure_remote_host,
+            )
+            show_requests += 1
+            if performance is not None:
+                performance["show_duration_ms"] = round(
+                    float(performance.get("show_duration_ms", 0.0)) + (time.perf_counter() - show_started) * 1000,
+                    3,
+                )
+            entry = _metadata_entry(name, tagged, shown)
+        else:
+            hits += 1
+        next_cache[key] = entry
+        inventory.append(_cache_entry_to_model(tagged, entry))
+    warning = save_metadata_cache({"schema_version": 1, "models": next_cache})
+    if warning:
+        warnings.append(warning)
+    if performance is not None:
+        performance["metadata_cache_hits"] = hits
+        performance["metadata_cache_misses"] = misses
+        performance["show_requests"] = show_requests
+    return inventory, warnings
+
+
+def model_inventory(
+    host: str,
+    allow_remote_host: bool = False,
+    allow_insecure_remote_host: bool = False,
+    refresh: bool = False,
+) -> list[dict[str, object]]:
+    inventory, _warnings = installed_model_inventory(
+        host,
+        allow_remote_host=allow_remote_host,
+        allow_insecure_remote_host=allow_insecure_remote_host,
+        refresh=refresh,
+    )
+    return [model_to_json(model) for model in inventory]
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def running_model_inventory(
+    host: str, allow_remote_host: bool = False, allow_insecure_remote_host: bool = False
+) -> list[RunningModel]:
+    result = request_json(
+        host,
+        "/api/ps",
+        allow_remote_host=allow_remote_host,
+        allow_insecure_remote_host=allow_insecure_remote_host,
+    )
+    raw_models = result.get("models", [])
+    if not isinstance(raw_models, list):
+        raise RuntimeError("Ollama returned an invalid running model list.")
+    running: list[RunningModel] = []
+    for item in raw_models:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        details = _model_details(item.get("details"))
+        context = _int_or_none(item.get("context_length"))
+        if context is None:
+            context = _int_or_none(details.get("context_length"))
+        running.append(
+            RunningModel(
+                name=str(item["name"]),
+                digest=item.get("digest") if isinstance(item.get("digest"), str) else None,
+                loaded_size_bytes=_int_or_none(item.get("size")),
+                loaded_vram_bytes=_int_or_none(item.get("size_vram")),
+                loaded_context_length=context,
+                expires_at=item.get("expires_at") if isinstance(item.get("expires_at"), str) else None,
+            )
         )
-        shown_details = _model_details(shown.get("details"))
-        details = {**tagged_details, **shown_details}
-        families = details.get("families")
-        capabilities = shown.get("capabilities")
-        inventory.append({
-            "name": name,
-            "size_bytes": tagged.get("size") if isinstance(tagged.get("size"), int) else None,
-            "family": details.get("family") if isinstance(details.get("family"), str) else None,
-            "families": families if isinstance(families, list) else [],
-            "parameter_size": (
-                details.get("parameter_size") if isinstance(details.get("parameter_size"), str) else None
-            ),
-            "quantization": (
-                details.get("quantization_level")
-                if isinstance(details.get("quantization_level"), str)
-                else None
-            ),
-            "capabilities": capabilities if isinstance(capabilities, list) else [],
-            "context_length": _context_length(shown.get("model_info")),
-        })
-    return inventory
+    return running
+
+
+def _total_memory_bytes() -> int | None:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = os.sysconf("SC_PHYS_PAGES")
+        if isinstance(page_size, int) and isinstance(pages, int) and page_size > 0 and pages > 0:
+            return page_size * pages
+    except (OSError, ValueError, AttributeError):
+        pass
+    if platform.system().lower() == "linux":
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) * KIB
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        return int(completed.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _parse_memory_pressure_available(output: str, total_bytes: int | None) -> int | None:
+    if total_bytes is None:
+        return None
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", output)
+    if match:
+        return int(total_bytes * (int(match.group(1)) / 100.0))
+    return None
+
+
+def _parse_vm_stat_available(output: str) -> int | None:
+    page_match = re.search(r"page size of (\d+) bytes", output)
+    if not page_match:
+        return None
+    page_size = int(page_match.group(1))
+    reclaimable_names = (
+        "Pages free",
+        "Pages inactive",
+        "Pages speculative",
+        "Pages purgeable",
+        "File-backed pages",
+    )
+    pages = 0
+    for line in output.splitlines():
+        for name in reclaimable_names:
+            if line.startswith(name + ":"):
+                value = line.split(":", 1)[1].strip().rstrip(".")
+                try:
+                    pages += int(value)
+                except ValueError:
+                    pass
+    return pages * page_size
+
+
+def inspect_system_memory() -> SystemMemory:
+    system = platform.system().lower()
+    architecture = platform.machine().lower()
+    memory_model = "unified" if system == "darwin" and architecture == "arm64" else "system"
+    warnings: list[str] = []
+    total_bytes = _total_memory_bytes()
+    available_bytes: int | None = None
+    confidence = "high"
+    if system == "linux":
+        try:
+            facts: dict[str, int] = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].rstrip(":") in {"MemTotal", "MemAvailable"}:
+                        facts[parts[0].rstrip(":")] = int(parts[1]) * KIB
+            total_bytes = facts.get("MemTotal", total_bytes)
+            available_bytes = facts.get("MemAvailable")
+        except (OSError, ValueError):
+            warnings.append("Linux memory inspection failed.")
+            confidence = "low"
+    elif system == "darwin":
+        try:
+            completed = subprocess.run(
+                ["memory_pressure", "-Q"],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            available_bytes = _parse_memory_pressure_available(completed.stdout, total_bytes)
+        if available_bytes is None:
+            try:
+                fallback = subprocess.run(
+                    ["vm_stat"],
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2,
+                )
+            except (OSError, subprocess.SubprocessError):
+                fallback = None
+            if fallback is not None and fallback.returncode == 0:
+                available_bytes = _parse_vm_stat_available(fallback.stdout)
+                confidence = "medium"
+            else:
+                warnings.append("macOS memory inspection failed.")
+                confidence = "low"
+    else:
+        warnings.append(f"System memory inspection is not implemented for {system}.")
+        confidence = "low"
+    protected_reserve_bytes = None
+    model_budget_bytes = None
+    if total_bytes is not None and available_bytes is not None:
+        protected_reserve_bytes = max(MIN_SYSTEM_RESERVE_BYTES, int(total_bytes * SYSTEM_RESERVE_RATIO))
+        capacity_after_reserve = max(0, total_bytes - protected_reserve_bytes)
+        model_budget_bytes = max(0, min(available_bytes, capacity_after_reserve))
+    else:
+        warnings.append("Memory budget is unknown; recommendations cannot be marked safe.")
+    return SystemMemory(
+        platform=system,
+        architecture=architecture,
+        memory_model=memory_model if memory_model == "unified" else ("system" if system in {"linux", "darwin"} else "unknown"),
+        total_bytes=total_bytes,
+        available_bytes=available_bytes,
+        protected_reserve_bytes=protected_reserve_bytes,
+        model_budget_bytes=model_budget_bytes,
+        confidence=confidence,
+        warnings=tuple(warnings),
+    )
+
+
+def _fallback_kv_bytes(num_ctx: int) -> tuple[int, str]:
+    if num_ctx <= 8192:
+        return 1 * GIB, "fallback"
+    if num_ctx <= 16384:
+        return 2 * GIB, "fallback"
+    if num_ctx <= 32768:
+        return 4 * GIB, "fallback"
+    return 6 * GIB, "fallback"
+
+
+def estimate_model_memory(
+    installed: InstalledModel, running: RunningModel | None, system: SystemMemory, num_ctx: int
+) -> ModelMemoryEstimate:
+    warnings: list[str] = []
+    if installed.kv_bytes_per_token_f16 is not None:
+        kv_cache_bytes = installed.kv_bytes_per_token_f16 * num_ctx
+        confidence = "medium"
+    else:
+        kv_cache_bytes, confidence = _fallback_kv_bytes(num_ctx)
+        warnings.append("KV-cache estimate used a conservative fallback.")
+    weights_bytes = installed.size_bytes
+    runtime_overhead_bytes = None
+    estimated_required_bytes = None
+    if running is not None and (running.loaded_context_length is None or running.loaded_context_length >= num_ctx):
+        observed = running.loaded_size_bytes or installed.size_bytes
+        estimated_required_bytes = 0 if observed is not None else None
+        status = "resident" if estimated_required_bytes == 0 else "unknown"
+        headroom = system.model_budget_bytes if estimated_required_bytes == 0 else None
+        return ModelMemoryEstimate(
+            status=status,
+            weights_bytes=observed,
+            runtime_overhead_bytes=0 if observed is not None else None,
+            kv_cache_bytes=0 if observed is not None else kv_cache_bytes,
+            estimated_required_bytes=estimated_required_bytes,
+            estimated_headroom_bytes=headroom,
+            confidence="high" if status == "resident" else "low",
+            warnings=tuple(warnings),
+        )
+    if weights_bytes is not None:
+        runtime_overhead_bytes = max(512 * MIB, int(weights_bytes * 0.15))
+        if running is not None and running.loaded_size_bytes is not None:
+            loaded_context = running.loaded_context_length or 0
+            additional_context = max(0, num_ctx - loaded_context)
+            if installed.kv_bytes_per_token_f16 is not None:
+                kv_cache_bytes = installed.kv_bytes_per_token_f16 * additional_context
+            estimated_required_bytes = runtime_overhead_bytes + kv_cache_bytes
+        else:
+            estimated_required_bytes = weights_bytes + runtime_overhead_bytes + kv_cache_bytes
+            warnings.append("Runtime memory for unloaded models is estimated.")
+    if estimated_required_bytes is None or system.model_budget_bytes is None or system.total_bytes is None:
+        return ModelMemoryEstimate(
+            status="unknown",
+            weights_bytes=weights_bytes,
+            runtime_overhead_bytes=runtime_overhead_bytes,
+            kv_cache_bytes=kv_cache_bytes,
+            estimated_required_bytes=estimated_required_bytes,
+            estimated_headroom_bytes=None,
+            confidence="low",
+            warnings=tuple(warnings),
+        )
+    headroom = system.model_budget_bytes - estimated_required_bytes
+    safe_headroom = max(MIN_SAFE_HEADROOM_BYTES, int(system.total_bytes * SAFE_HEADROOM_RATIO))
+    if estimated_required_bytes > system.model_budget_bytes:
+        status = "unsafe"
+    elif headroom >= safe_headroom:
+        status = "safe"
+    else:
+        status = "tight"
+    return ModelMemoryEstimate(
+        status=status,
+        weights_bytes=weights_bytes,
+        runtime_overhead_bytes=runtime_overhead_bytes,
+        kv_cache_bytes=kv_cache_bytes,
+        estimated_required_bytes=estimated_required_bytes,
+        estimated_headroom_bytes=headroom,
+        confidence=confidence,
+        warnings=tuple(warnings),
+    )
+
+
+def command_profile(command: str, override: str | None = None) -> str:
+    if override:
+        return override
+    if command in FAST_COMMANDS:
+        return "fast"
+    if command in BALANCED_COMMANDS:
+        return "balanced"
+    return "strong"
+
+
+def _running_by_model(inventory: list[RunningModel]) -> dict[tuple[str, str | None], RunningModel]:
+    result: dict[tuple[str, str | None], RunningModel] = {}
+    for item in inventory:
+        result[(item.name, item.digest)] = item
+        result[(item.name, None)] = item
+        if item.digest:
+            result[("", item.digest)] = item
+    return result
+
+
+def matching_running_model(
+    lookup: dict[tuple[str, str | None], RunningModel], model: InstalledModel
+) -> RunningModel | None:
+    if model.digest:
+        match = lookup.get(("", model.digest))
+        if match is not None:
+            return match
+    return lookup.get((model.name, model.digest)) or lookup.get((model.name, None))
+
+
+def _coding_rank(signal: str) -> int:
+    return {"strong": 2, "generic": 1, "unknown": 0, "unsuitable": -1}.get(signal, -1)
+
+
+def _fit_rank(status: str) -> int:
+    return {"resident": 2, "safe": 2, "tight": 1}.get(status, 0)
+
+
+def candidate_reasons(model: InstalledModel, memory: ModelMemoryEstimate, num_ctx: int) -> tuple[str, ...]:
+    reasons = []
+    if model.coding_signal == "strong":
+        reasons.append("coding-oriented")
+    elif model.coding_signal == "generic":
+        reasons.append("general-completion")
+    if model.context_length is None or model.context_length >= num_ctx:
+        reasons.append("context-supported")
+    if memory.status in {"resident", "safe"}:
+        reasons.append("memory-safe")
+    elif memory.status == "tight":
+        reasons.append("memory-tight")
+    return tuple(reasons)
+
+
+def ranking_key(
+    model: InstalledModel,
+    running: RunningModel | None,
+    memory: ModelMemoryEstimate,
+    profile: str,
+    preferred: set[str],
+) -> tuple[object, ...]:
+    coding = _coding_rank(model.coding_signal)
+    fit = _fit_rank(memory.status)
+    preference = 1 if model.name in preferred else 0
+    parameter_count = model.parameter_count or 0
+    required = memory.estimated_required_bytes if memory.estimated_required_bytes is not None else 10**30
+    headroom = memory.estimated_headroom_bytes if memory.estimated_headroom_bytes is not None else -1
+    loaded = 1 if running is not None else 0
+    quantization_rank = model.quantization_rank or 0
+    if profile == "fast":
+        return (coding, fit, preference, -required, loaded, parameter_count, model.name)
+    if profile == "balanced":
+        return (coding, fit, preference, parameter_count, headroom, loaded, model.name)
+    return (coding, fit, preference, parameter_count, quantization_rank, loaded, headroom, model.name)
+
+
+def build_candidates(
+    installed: list[InstalledModel],
+    running: list[RunningModel],
+    system: SystemMemory,
+    *,
+    command: str,
+    num_ctx: int,
+    quality: str | None,
+    preferred: set[str],
+    excluded: set[str],
+) -> tuple[list[ModelCandidate], list[dict[str, object]], list[str]]:
+    running_lookup = _running_by_model(running)
+    profile = command_profile(command, quality)
+    candidates: list[ModelCandidate] = []
+    rejected: list[dict[str, object]] = []
+    warnings: list[str] = []
+    installed_names = {model.name for model in installed}
+    for name in sorted(preferred - installed_names):
+        warnings.append(f"Preferred model is not installed: {name}")
+    for name in sorted(excluded - installed_names):
+        warnings.append(f"Excluded model is not installed: {name}")
+    for model in installed:
+        reasons: list[str] = []
+        if model.name in excluded:
+            reasons.append("explicitly-excluded")
+        if model.coding_signal == "unsuitable":
+            reasons.append("unsuitable-for-coding")
+        if model.context_length is not None and model.context_length < num_ctx:
+            reasons.append("insufficient-context")
+        running_model = matching_running_model(running_lookup, model)
+        memory = estimate_model_memory(model, running_model, system, num_ctx)
+        if memory.status == "unsafe":
+            reasons.append("unsafe-memory")
+        elif memory.status == "unknown":
+            reasons.append("unknown-memory")
+        if reasons:
+            rejected.append({
+                "model": model.name,
+                "reasons": reasons,
+                "memory": memory_to_json(memory),
+                "context_length": model.context_length,
+            })
+            continue
+        key = ranking_key(model, running_model, memory, profile, preferred)
+        candidates.append(ModelCandidate(model, running_model, memory, profile, key, candidate_reasons(model, memory, num_ctx)))
+    candidates.sort(key=lambda item: item.ranking_key, reverse=True)
+    return candidates, rejected, warnings
+
+
+def recommend_model(
+    host: str,
+    *,
+    command: str,
+    num_ctx: int,
+    quality: str | None = None,
+    preferred_models: tuple[str, ...] = (),
+    excluded_models: tuple[str, ...] = (),
+    refresh: bool = False,
+    allow_remote_host: bool = False,
+    allow_insecure_remote_host: bool = False,
+) -> dict[str, object]:
+    if command not in COMMANDS:
+        raise UsageError(f"Unsupported local-agent command for recommendation: {command}")
+    started = time.perf_counter()
+    performance: dict[str, object] = {}
+    installed, cache_warnings = installed_model_inventory(
+        host,
+        allow_remote_host=allow_remote_host,
+        allow_insecure_remote_host=allow_insecure_remote_host,
+        refresh=refresh,
+        performance=performance,
+    )
+    ps_started = time.perf_counter()
+    running = running_model_inventory(host, allow_remote_host, allow_insecure_remote_host)
+    performance["ps_duration_ms"] = round((time.perf_counter() - ps_started) * 1000, 3)
+    memory_started = time.perf_counter()
+    system = inspect_system_memory()
+    performance["memory_duration_ms"] = round((time.perf_counter() - memory_started) * 1000, 3)
+    candidates, rejected, candidate_warnings = build_candidates(
+        installed,
+        running,
+        system,
+        command=command,
+        num_ctx=num_ctx,
+        quality=quality,
+        preferred=set(preferred_models),
+        excluded=set(excluded_models),
+    )
+    performance["total_duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    warnings = [*cache_warnings, *system.warnings, *candidate_warnings]
+    if not candidates:
+        return {
+            "schema_version": RECOMMENDATION_JSON_SCHEMA_VERSION,
+            "request": recommendation_request_json(command, command_profile(command, quality), num_ctx, preferred_models, excluded_models),
+            "performance": performance,
+            "system": system_memory_to_json(system),
+            "recommendation": None,
+            "candidates": [],
+            "excluded": rejected,
+            "assumptions": recommendation_assumptions(),
+            "warnings": warnings,
+        }
+    selected = candidates[0]
+    reasons = list(selected.reasons)
+    if selected.profile == "strong":
+        reasons.append("strongest-safe-candidate")
+    elif selected.profile == "fast":
+        reasons.append("lightweight-suitable-candidate")
+    else:
+        reasons.append("balanced-suitable-candidate")
+    return {
+        "schema_version": RECOMMENDATION_JSON_SCHEMA_VERSION,
+        "request": recommendation_request_json(command, selected.profile, num_ctx, preferred_models, excluded_models),
+        "performance": performance,
+        "system": system_memory_to_json(system),
+        "recommendation": {
+            "model": selected.installed.name,
+            "coding_signal": selected.installed.coding_signal,
+            "memory_status": selected.memory.status,
+            "parameter_count": selected.installed.parameter_count,
+            "quantization": selected.installed.quantization,
+            "estimated_required_bytes": selected.memory.estimated_required_bytes,
+            "estimated_headroom_bytes": selected.memory.estimated_headroom_bytes,
+            "reason_codes": reasons,
+        },
+        "candidates": [candidate_to_json(candidate) for candidate in candidates],
+        "excluded": rejected,
+        "assumptions": recommendation_assumptions(),
+        "warnings": warnings,
+    }
+
+
+def recommendation_request_json(
+    command: str,
+    quality_profile: str,
+    num_ctx: int,
+    preferred_models: tuple[str, ...],
+    excluded_models: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "command": command,
+        "quality_profile": quality_profile,
+        "num_ctx": num_ctx,
+        "preferred_models": list(preferred_models),
+        "excluded_models": list(excluded_models),
+    }
+
+
+def recommendation_assumptions() -> list[str]:
+    return [
+        "Runtime memory for unloaded models is estimated from artifact size plus KV-cache requirements.",
+        "Quantization is used conservatively as a tie-breaker, not as a universal quality score.",
+        "No model is loaded, unloaded, benchmarked, or used for inference during recommendation.",
+    ]
+
+
+def model_to_json(model: InstalledModel) -> dict[str, object]:
+    return {
+        "name": model.name,
+        "digest": model.digest,
+        "size_bytes": model.size_bytes,
+        "family": model.family,
+        "families": list(model.families),
+        "parameter_size": model.parameter_size,
+        "parameter_count": model.parameter_count,
+        "quantization": model.quantization,
+        "quantization_rank": model.quantization_rank,
+        "capabilities": list(model.capabilities),
+        "context_length": model.context_length,
+        "coding_signal": model.coding_signal,
+        "base_model_key": model.base_model_key,
+        "kv_bytes_per_token_f16": model.kv_bytes_per_token_f16,
+    }
+
+
+def running_to_json(running: RunningModel | None) -> dict[str, object] | None:
+    return None if running is None else asdict(running)
+
+
+def memory_to_json(memory: ModelMemoryEstimate) -> dict[str, object]:
+    return {
+        "status": memory.status,
+        "weights_bytes": memory.weights_bytes,
+        "runtime_overhead_bytes": memory.runtime_overhead_bytes,
+        "kv_cache_bytes": memory.kv_cache_bytes,
+        "estimated_required_bytes": memory.estimated_required_bytes,
+        "estimated_headroom_bytes": memory.estimated_headroom_bytes,
+        "confidence": memory.confidence,
+        "warnings": list(memory.warnings),
+    }
+
+
+def system_memory_to_json(system: SystemMemory) -> dict[str, object]:
+    return {
+        "platform": system.platform,
+        "architecture": system.architecture,
+        "memory_model": system.memory_model,
+        "total_bytes": system.total_bytes,
+        "available_bytes": system.available_bytes,
+        "protected_reserve_bytes": system.protected_reserve_bytes,
+        "model_budget_bytes": system.model_budget_bytes,
+        "confidence": system.confidence,
+        "warnings": list(system.warnings),
+    }
+
+
+def candidate_to_json(candidate: ModelCandidate) -> dict[str, object]:
+    return {
+        "model": model_to_json(candidate.installed),
+        "running": running_to_json(candidate.running),
+        "memory": memory_to_json(candidate.memory),
+        "profile": candidate.profile,
+        "ranking_key": list(candidate.ranking_key),
+        "reason_codes": list(candidate.reasons),
+    }
+
+
+def format_recommendation(payload: dict[str, object]) -> str:
+    recommendation = payload.get("recommendation")
+    if not isinstance(recommendation, dict):
+        return "No safe eligible model was found."
+    request = payload["request"]
+    assert isinstance(request, dict)
+    system = payload["system"]
+    assert isinstance(system, dict)
+    lines = [
+        "Recommended model:",
+        f"  {recommendation['model']}",
+        "",
+        "Profile:",
+        f"  {request['quality_profile']}",
+        "",
+        "Requested context:",
+        f"  {int(request['num_ctx']):,} tokens",
+        "",
+        "Memory fit:",
+        f"  {recommendation['memory_status']}",
+        "",
+        "Why selected:",
+    ]
+    for reason in recommendation.get("reason_codes", []):
+        lines.append(f"  - {str(reason).replace('-', ' ')}")
+    warnings = payload.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        lines.extend(["", "Warnings:"])
+        for warning in warnings:
+            lines.append(f"  - {warning}")
+    return "\n".join(lines)
 
 
 def select_model(models: list[str], saved: str | None = None) -> str:
@@ -1239,12 +2131,28 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--show", action="store_true")
     models = subparsers.add_parser("models", help="List models installed in Ollama.")
     models.add_argument("--json", action="store_true", dest="as_json")
+    models.add_argument("--verbose", action="store_true")
     models.add_argument("--host")
     models.add_argument("--model")
     models.add_argument("--num-ctx", type=int)
     models.add_argument("--max-chars", type=int)
     models.add_argument("--allow-remote-host", action="store_true")
     models.add_argument("--allow-insecure-remote-host", action="store_true")
+    recommend = subparsers.add_parser("recommend-model", help="Recommend an installed Ollama model for a local-agent command.")
+    recommend.add_argument("command", choices=COMMANDS)
+    recommend.add_argument("--num-ctx", type=int)
+    recommend.add_argument("--quality", choices=QUALITY_PROFILES)
+    recommend.add_argument("--prefer-model", action="append", default=[])
+    recommend.add_argument("--exclude-model", action="append", default=[])
+    recommend.add_argument("--refresh", action="store_true")
+    output = recommend.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", dest="as_json")
+    output.add_argument("--name-only", action="store_true")
+    recommend.add_argument("--host")
+    recommend.add_argument("--model")
+    recommend.add_argument("--max-chars", type=int)
+    recommend.add_argument("--allow-remote-host", action="store_true")
+    recommend.add_argument("--allow-insecure-remote-host", action="store_true")
     return parser
 
 
@@ -1294,19 +2202,93 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = validate_config(load_config())
+        if args.mode == "recommend-model":
+            settings = resolve_settings(args, config, require_model=False)
+            num_ctx = _positive_int(args.num_ctx if args.num_ctx is not None else settings.num_ctx, "num_ctx")
+            payload = recommend_model(
+                settings.host,
+                command=args.command,
+                num_ctx=num_ctx,
+                quality=args.quality,
+                preferred_models=tuple(args.prefer_model),
+                excluded_models=tuple(args.exclude_model),
+                refresh=args.refresh,
+                allow_remote_host=args.allow_remote_host,
+                allow_insecure_remote_host=args.allow_insecure_remote_host,
+            )
+            recommendation = payload.get("recommendation")
+            if args.as_json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            elif args.name_only:
+                if isinstance(recommendation, dict):
+                    print(recommendation["model"])
+                for warning in payload.get("warnings", []):
+                    print(f"local-agent: warning: {warning}", file=sys.stderr)
+            else:
+                print(format_recommendation(payload))
+            return 0 if isinstance(recommendation, dict) else 1
         if args.mode == "models":
             settings = resolve_settings(args, config, require_model=False)
-            if args.as_json:
-                print(json.dumps({
+            if args.as_json or args.verbose:
+                performance: dict[str, object] = {}
+                installed, warnings = installed_model_inventory(
+                    settings.host,
+                    allow_remote_host=args.allow_remote_host,
+                    allow_insecure_remote_host=args.allow_insecure_remote_host,
+                    performance=performance,
+                )
+                ps_started = time.perf_counter()
+                running = running_model_inventory(
+                    settings.host,
+                    allow_remote_host=args.allow_remote_host,
+                    allow_insecure_remote_host=args.allow_insecure_remote_host,
+                )
+                performance["ps_duration_ms"] = round((time.perf_counter() - ps_started) * 1000, 3)
+                memory_started = time.perf_counter()
+                system = inspect_system_memory()
+                performance["memory_duration_ms"] = round((time.perf_counter() - memory_started) * 1000, 3)
+                running_lookup = _running_by_model(running)
+                model_entries = []
+                for model in installed:
+                    running_model = matching_running_model(running_lookup, model)
+                    memory = estimate_model_memory(model, running_model, system, settings.num_ctx)
+                    entry = model_to_json(model)
+                    entry.update({
+                        "running": running_to_json(running_model),
+                        "memory": memory_to_json(memory),
+                    })
+                    model_entries.append(entry)
+                payload = {
                     "schema_version": MODELS_JSON_SCHEMA_VERSION,
                     "host": settings.host,
                     "default_model": settings.model or None,
-                    "models": model_inventory(
-                        settings.host,
-                        allow_remote_host=args.allow_remote_host,
-                        allow_insecure_remote_host=args.allow_insecure_remote_host,
-                    ),
+                    "effective_num_ctx": settings.num_ctx,
+                    "models": model_entries,
+                    "running_models": [asdict(item) for item in running],
+                    "system": system_memory_to_json(system),
+                    "cache": {
+                        "path": str(model_metadata_cache_path()),
+                        "metadata_cache_hits": performance.get("metadata_cache_hits", 0),
+                        "metadata_cache_misses": performance.get("metadata_cache_misses", 0),
+                        "show_requests": performance.get("show_requests", 0),
+                    },
+                    "warnings": [*warnings, *system.warnings],
+                }
+            if args.as_json:
+                print(json.dumps({
+                    **payload,
                 }, indent=2, sort_keys=True))
+                return 0
+            if args.verbose:
+                for model in payload["models"]:
+                    assert isinstance(model, dict)
+                    print(f"{model['name']}")
+                    print(f"  context: {model.get('context_length') or 'unknown'}")
+                    print(f"  coding: {model.get('coding_signal')}")
+                    print(f"  memory: {model['memory']['status']}")  # type: ignore[index]
+                    print(f"  running: {'yes' if model.get('running') else 'no'}")
+                for warning in payload["warnings"]:
+                    print(f"warning: {warning}", file=sys.stderr)
                 return 0
             for model in discover_models(
                 settings.host,
