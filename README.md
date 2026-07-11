@@ -99,17 +99,55 @@ branch.
 ```bash
 local-agent models
 local-agent models --json
+local-agent recommend-model review --num-ctx 16384 --name-only
 local-agent configure
 local-agent files "Explain responsibilities and risks" src/client.py src/retry.py
 ```
 
 Plain `models` prints the installed model names, one per line. `models --json`
-combines Ollama's `/api/tags` and `/api/show` endpoints and reports a
-versioned JSON document with `schema_version`, the host, the configured default
-model, model sizes, family metadata, parameter sizes, quantization,
-capabilities, and context lengths. Missing optional metadata is reported as
-`null` or an empty list. Settings resolve in this order: command-line flag,
-environment, then saved configuration.
+reports a versioned JSON document with `schema_version`, the host, the
+configured default model, model sizes, family metadata, parameter sizes,
+quantization, capabilities, context lengths, running state, memory estimates,
+and cache status. Missing optional metadata is reported as `null` or an empty
+list. Settings resolve in this order: command-line flag, environment, then
+saved configuration.
+
+Normal agent use should ask the deterministic recommender for a model name and
+then pass that model explicitly:
+
+```bash
+MODEL="$(
+  local-agent recommend-model review \
+    --num-ctx 16384 \
+    --name-only
+)"
+
+local-agent review \
+  "Look for correctness regressions" \
+  src/client.py tests/test_client.py \
+  --model "$MODEL" \
+  --num-ctx 16384
+```
+
+For diagnostics:
+
+```bash
+local-agent recommend-model review \
+  --num-ctx 16384 \
+  --json
+local-agent models --verbose
+```
+
+To rebuild static model metadata:
+
+```bash
+local-agent recommend-model review --refresh
+```
+
+Warm recommendations read cached static metadata by model name and digest, then
+inspect `/api/tags`, `/api/ps`, and current system memory. They avoid
+`/api/show` when the cache is current, and they never load, unload, benchmark,
+or run inference with a model.
 
 ```bash
 export LOCAL_AGENT_MODEL='llama3.2:latest'
@@ -222,6 +260,14 @@ local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
 The quality of each result depends on the selected Ollama model, its coding ability, quantization, context length, and the context supplied to it. Smaller or heavily quantized models may misunderstand code, miss cross-file behavior, produce invalid patches, or make incorrect claims.
 
 `local-agent` does not treat model output as authoritative. Every referenced file, symbol, command, test claim, and proposed patch must be independently verified before use. Security-sensitive, destructive, deployment-related, or public-API decisions should not be delegated to a local model as the final decision-maker.
+
+The recommender is conservative and explainable, not a quality leaderboard.
+Installed size is not exact runtime memory usage, runtime memory for unloaded
+models is estimated, and a model classified as safe may still generate slowly.
+Parameter count does not fully determine model quality, mixture-of-experts total
+parameters can overstate active computation, and quantization comparisons are
+only used conservatively. Unsafe models are never selected, and preferences
+cannot bypass context or memory safety filters.
 
 ### Context may be incomplete or truncated
 
