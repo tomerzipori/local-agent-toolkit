@@ -431,6 +431,7 @@ class ContextTests(LocalAgentTestCase):
             self._commit(work, "base")
             self._git(work, "remote", "add", "origin", str(origin))
             self._git(work, "push", "-u", "origin", "main")
+            self._git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
             self._git(Path(directory), "clone", "--depth", "2", f"file://{origin}", str(shallow))
             self._git(shallow, "checkout", "-b", "feature")
             (shallow / "tracked.py").write_text("value = 2\n", encoding="utf-8")
