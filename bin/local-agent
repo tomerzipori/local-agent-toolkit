@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 from urllib.parse import urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.1.4"
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_NUM_CTX = 32768
 DEFAULT_MAX_CHARS = 120_000

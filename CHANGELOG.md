@@ -6,10 +6,30 @@ The project follows semantic versioning. Because the project is still before ver
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-11
+
+### Added
+
+- Added installable personal skills for Codex and Claude Code.
+- Added deterministic Ollama model recommendation based on command profile,
+  context capacity, model metadata, and estimated memory fit.
+- Added model recommendation diagnostics and benchmark helpers.
+- Added installer and skill validation tooling.
+- Added expanded installer, configuration, model-cache, and delegation
+  documentation.
+
 ### Changed
 
+- Reorganized the README around bounded local-model delegation and contribution.
+- Expanded contributor guidance for commands, recommendation behavior, testing,
+  and safety.
 - `install.sh --uninstall --purge-config` now removes both
   `~/.config/local-agent` and `~/.cache/local-agent`.
+
+### Fixed
+
+- Fixed reinstall confirmation behavior for existing managed installations.
+- Improved no-op uninstall behavior when no managed installation exists.
 
 ## [0.1.0] - 2026-07-11
 
@@ -96,5 +116,6 @@ Initial public release of Local Agent Toolkit.
 * The `fix-test` command executes the supplied shell command locally before sending its output to the model.
 * Local-model suggestions are not automatically applied and must be reviewed, tested, and accepted by the parent agent or user.
 
-[Unreleased]: https://github.com/tomerzipori/local-agent-toolkit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tomerzipori/local-agent-toolkit/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/tomerzipori/local-agent-toolkit/releases/tag/v0.1.4
 [0.1.0]: https://github.com/tomerzipori/local-agent-toolkit/releases/tag/v0.1.0
