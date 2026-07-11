@@ -15,9 +15,16 @@ source ~/.zshrc
 local-agent --help
 ```
 
-The installer copies only `bin/local-agent` to `~/.local/bin`, safely upgrades
-that copy on repeat runs, adds `~/.local/bin` to `.zshrc`, and attempts
-interactive configuration when run from a terminal. In a terminal, the
+The installer manages its own binary at
+`~/.local/share/local-agent-toolkit/bin/local-agent` and exposes
+`~/.local/bin/local-agent` as a symlink to that managed path. Repeat installs
+atomically replace only the managed binary when the public command is still
+owned by this toolkit. If `~/.local/bin/local-agent` is a regular file, a
+directory, or a symlink to something else, installation refuses to replace it
+and asks you to move or remove it manually first.
+
+The installer adds a removable, toolkit-managed PATH block to `.zshrc` only
+when `~/.local/bin` is not already exported there elsewhere. In a terminal, the
 installer prompts whether to install Codex instructions, Claude instructions,
 both, or neither. Choose explicitly for scripts and CI:
 
@@ -26,6 +33,7 @@ both, or neither. Choose explicitly for scripts and CI:
 ./install.sh --instructions claude
 ./install.sh --instructions both
 ./install.sh --instructions none
+./install.sh --dry-run --instructions both
 ```
 
 Instructions are installed globally into `~/.codex/AGENTS.md` and/or
@@ -34,15 +42,24 @@ repeat installs while unrelated instructions are preserved. When the flag is
 omitted in a noninteractive environment, instruction installation is skipped.
 Restart existing Codex or Claude sessions after changing these files.
 
+Dry runs inspect the current public command, managed install paths, `.zshrc`,
+and instruction files, then print the changes that would be made without
+writing files or invoking `local-agent configure`.
+
 Uninstall with:
 
 ```bash
 ./install.sh --uninstall
+./install.sh --uninstall --purge-config
 ```
 
-Uninstall removes the binary and only the toolkit-managed instruction blocks.
-Configuration is saved at `~/.config/local-agent/config.json` with restrictive
-file permissions, and the installer does not delete that configuration.
+Uninstall removes the public symlink only when it still resolves to the
+toolkit-managed binary, then removes the managed installation directory, the
+toolkit-managed PATH block, and the toolkit-managed instruction blocks. User
+configuration at `~/.config/local-agent/config.json` is preserved unless
+`--purge-config` is passed. Uninstall is still driven by the repository's
+`install.sh`; a future `local-agent uninstall` command is not part of this
+branch.
 
 ## Ollama models and settings
 
