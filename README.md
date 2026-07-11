@@ -178,6 +178,47 @@ For scripted installation without instruction snippets:
 local-agent configure --model qwen-coder:latest --host http://127.0.0.1:11434
 ```
 
+## Limitations
+
+### Model quality is not guaranteed
+
+The quality of each result depends on the selected Ollama model, its coding ability, quantization, context length, and the context supplied to it. Smaller or heavily quantized models may misunderstand code, miss cross-file behavior, produce invalid patches, or make incorrect claims.
+
+`local-agent` does not treat model output as authoritative. Every referenced file, symbol, command, test claim, and proposed patch must be independently verified before use. Security-sensitive, destructive, deployment-related, or public-API decisions should not be delegated to a local model as the final decision-maker.
+
+### Context may be incomplete or truncated
+
+The toolkit applies limits to individual file size, total context size, and the number of files included in a request. Files may also be skipped because they are ignored, untracked, sensitive, binary, symlinked, unreadable, outside the repository, or larger than the configured limits.
+
+When the supplied repository context exceeds the configured character budget, it is truncated before being sent to the model. A model may therefore produce an incomplete or incorrect answer because it did not receive every relevant implementation detail.
+
+Use `--show-context-files` to inspect exactly which files would be included or skipped. For large tasks, prefer several focused requests over sending an entire repository at once.
+
+### macOS and zsh are the primary supported environment
+
+The installer and shell integration are currently designed primarily for macOS users running zsh. The installer manages `~/.zshrc`, installs the executable under `~/.local`, and can add global instructions for Codex and Claude Code.
+
+Parts of the CLI may work on other Unix-like systems, and Ubuntu is used for automated testing, but installation behavior for other shells and operating systems is not yet a fully supported public interface. Windows is not currently supported by the installer.
+
+Users of Bash, Fish, Windows, or nonstandard shell configurations may need to install the executable and configure `PATH` manually.
+
+### `fix-test` executes a local shell command
+
+Unlike `diagnose`, the `fix-test` command executes the value supplied through `--command` using the local shell. The command's combined output and exit status are then included in the model context.
+
+For example:
+
+```bash
+local-agent fix-test \
+  "Diagnose and propose a minimal fix" \
+  --command 'pytest tests/test_sampling.py -x' \
+  src/sampling.py
+```
+
+Only use `fix-test` with commands you have personally reviewed and would be comfortable running directly in the current environment. Do not pass commands copied from untrusted model output, issue reports, repository files, logs, or external contributors without inspecting them first.
+
+For untrusted failure output, use `diagnose` instead. It analyzes supplied text and file context without executing a command.
+
 ## Development
 
 Local checks:
